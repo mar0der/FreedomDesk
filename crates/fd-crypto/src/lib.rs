@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
@@ -54,7 +54,13 @@ impl Identity {
             return Self::load(path);
         }
         let id = Self::generate()?;
-        id.save(path)?;
+        if let Err(e) = id.save_new(path) {
+            // Lost a creation race with another process: use its key.
+            if path.exists() {
+                return Self::load(path);
+            }
+            return Err(e);
+        }
         log::info!("created new device identity at {}", path.display());
         Ok(id)
     }
@@ -81,17 +87,39 @@ impl Identity {
         Ok(Self { private, public: public.as_slice().try_into()? })
     }
 
+    /// Write to `path`, failing if it already exists (never clobbers a key).
+    pub fn save_new(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            create_private_dir(dir)?;
+        }
+        let body = self.serialize();
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(path).with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             create_private_dir(dir)?;
         }
-        let body = Zeroizing::new(format!(
+        write_private_file(path, self.serialize().as_bytes())
+    }
+
+    fn serialize(&self) -> Zeroizing<String> {
+        Zeroizing::new(format!(
             "# FreedomDesk device identity. KEEP PRIVATE. Never commit or share this file.\n\
              private={}\npublic={}\n",
             hex_encode(&self.private),
             hex_encode(&self.public)
-        ));
-        write_private_file(path, body.as_bytes())
+        ))
     }
 
     pub fn public_key(&self) -> &[u8; 32] {
@@ -162,7 +190,8 @@ pub fn accept(stream: TcpStream, id: &Identity) -> Result<Session> {
 
 fn run_handshake(mut stream: TcpStream, mut hs: HandshakeState, initiator: bool) -> Result<Session> {
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    // One deadline for the whole handshake: a peer trickling bytes can't hold us longer.
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let mut buf = vec![0u8; MAX_NOISE_MSG];
     let mut payload = vec![0u8; MAX_NOISE_MSG];
@@ -173,7 +202,7 @@ fn run_handshake(mut stream: TcpStream, mut hs: HandshakeState, initiator: bool)
             let n = hs.write_message(&[], &mut buf).map_err(|e| anyhow!("handshake write: {e}"))?;
             write_frame(&mut stream, &buf[..n])?;
         } else {
-            let msg = read_frame(&mut stream)?;
+            let msg = read_frame(&mut stream, Some(deadline))?;
             hs.read_message(&msg, &mut payload).map_err(|e| anyhow!("handshake failed: {e}"))?;
         }
         my_turn = !my_turn;
@@ -268,10 +297,17 @@ impl ShutdownHandle {
 
 impl SecureReader {
     pub fn recv(&mut self) -> Result<Vec<u8>> {
+        self.recv_limited(MAX_APP_MSG, None)
+    }
+
+    /// Receive one message of at most `max_len` bytes, failing if it isn't
+    /// complete by `deadline`. Use for anything read before the peer is authorised.
+    pub fn recv_limited(&mut self, max_len: usize, deadline: Option<Instant>) -> Result<Vec<u8>> {
+        let max_len = max_len.min(MAX_APP_MSG);
         let mut out = Vec::new();
         let mut plain = vec![0u8; MAX_NOISE_MSG];
         loop {
-            let frame = read_frame(&mut self.stream)?;
+            let frame = read_frame(&mut self.stream, deadline)?;
             let n = self
                 .transport
                 .read_message(self.nonce, &frame, &mut plain)
@@ -285,8 +321,8 @@ impl SecureReader {
                 1 => true,
                 _ => bail!("malformed frame flag"),
             };
-            if out.len() + n - 1 > MAX_APP_MSG {
-                bail!("peer message exceeds {MAX_APP_MSG} bytes");
+            if out.len() + n - 1 > max_len {
+                bail!("peer message exceeds {max_len} bytes");
             }
             out.extend_from_slice(&plain[1..n]);
             if !more {
@@ -311,13 +347,43 @@ fn write_frame(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
+fn read_frame(stream: &mut TcpStream, deadline: Option<Instant>) -> Result<Vec<u8>> {
     let mut len = [0u8; 2];
-    stream.read_exact(&mut len)?;
+    read_exact_by(stream, &mut len, deadline)?;
     let len = u16::from_be_bytes(len) as usize;
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
+    read_exact_by(stream, &mut buf, deadline)?;
     Ok(buf)
+}
+
+/// `read_exact`, but with an absolute deadline across all the underlying reads.
+fn read_exact_by(stream: &mut TcpStream, buf: &mut [u8], deadline: Option<Instant>) -> Result<()> {
+    let Some(deadline) = deadline else {
+        stream.read_exact(buf)?;
+        return Ok(());
+    };
+    let saved = stream.read_timeout()?;
+    let r = read_exact_deadline(stream, buf, deadline);
+    stream.set_read_timeout(saved)?;
+    r
+}
+
+fn read_exact_deadline(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("peer too slow (deadline exceeded)");
+        }
+        stream.set_read_timeout(Some(left))?;
+        match stream.read(&mut buf[done..]) {
+            Ok(0) => bail!(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- pinning
@@ -362,17 +428,29 @@ impl KnownHosts {
     }
 
     pub fn check(&self, label: &str, key: &[u8; 32]) -> PinCheck {
-        match self.entries.iter().find(|(l, _)| l == label) {
+        let label = label.to_ascii_lowercase();
+        match self.entries.iter().find(|(l, _)| *l == label) {
             None => PinCheck::Unknown,
             Some((_, k)) if k == key => PinCheck::Match,
             Some((_, k)) => PinCheck::Mismatch { pinned_fingerprint: fingerprint(k) },
         }
     }
 
+    /// Other labels under which this exact key is already pinned.
+    pub fn labels_for(&self, key: &[u8; 32]) -> Vec<String> {
+        self.entries.iter().filter(|(_, k)| k == key).map(|(l, _)| l.clone()).collect()
+    }
+
     pub fn pin(&mut self, label: &str, key: &[u8; 32]) -> Result<()> {
         if label.chars().any(char::is_whitespace) || label.is_empty() {
             bail!("invalid host label");
         }
+        let label = label.to_ascii_lowercase();
+        // Re-read so concurrent viewers don't drop each other's pins.
+        if let Ok(fresh) = Self::load(&self.path) {
+            self.entries = fresh.entries;
+        }
+        let label = label.as_str();
         self.entries.retain(|(l, _)| l != label);
         self.entries.push((label.to_string(), *key));
         let mut body = String::from("# FreedomDesk pinned host keys: <host> <x25519-public-key-hex>\n");
@@ -498,6 +576,40 @@ mod tests {
         assert_eq!(v.reader.recv().unwrap(), b"");
         v.writer.send(b"bye").unwrap();
         assert_eq!(t.join().unwrap(), b"bye");
+    }
+
+    #[test]
+    fn recv_limited_caps_size() {
+        let (mut h, mut v, _, _) = pair();
+        v.writer.send(&[7u8; 5000]).unwrap();
+        let err = h.reader.recv_limited(1024, None).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn handshake_deadline_beats_trickling_peer() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            // Announce a 32-byte frame, then dribble a byte every 100 ms.
+            s.write_all(&[0, 32]).unwrap();
+            for _ in 0..32 {
+                if s.write_all(&[0]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let (s, _) = l.accept().unwrap();
+        let host = Identity::generate().unwrap();
+        let start = Instant::now();
+        let deadline = Some(start + Duration::from_millis(500));
+        let mut s2 = s.try_clone().unwrap();
+        assert!(read_frame(&mut s2, deadline).is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop((s, host));
+        t.join().unwrap();
     }
 
     #[test]

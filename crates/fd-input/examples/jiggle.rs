@@ -25,7 +25,10 @@ fn main() -> anyhow::Result<()> {
     let d = 100;
     for (dx, dy) in [(d, 0), (d, d), (0, d), (0, 0)] {
         let (x, y) = (ox + dx, oy + dy);
-        inj.inject(&InputEvent::MouseMove { x: to_norm(x, w), y: to_norm(y, h) })?;
+        inj.inject(&InputEvent::MouseMove {
+            x: to_norm(x, w),
+            y: to_norm(y, h),
+        })?;
         std::thread::sleep(std::time::Duration::from_millis(300));
         let p = conn.query_pointer(root.root)?.reply()?;
         println!("asked {x},{y} -> pointer at {},{}", p.root_x, p.root_y);

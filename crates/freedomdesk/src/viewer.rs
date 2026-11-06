@@ -27,6 +27,9 @@ pub struct ViewArgs {
     /// Name shown to the host user in the consent prompt.
     #[arg(long)]
     name: Option<String>,
+    /// Trust and pin an unknown host key without asking (non-interactive use).
+    #[arg(long)]
+    trust_new: bool,
 }
 
 struct Connected {
@@ -90,11 +93,19 @@ fn connect(dir: &Path, args: &ViewArgs) -> Result<Connected> {
     match kh.check(&label, &session.remote_public) {
         PinCheck::Match => {}
         PinCheck::Unknown => {
-            kh.pin(&label, &session.remote_public)?;
-            eprintln!("New host {label}: pinned fingerprint {host_fp}");
-            if args.expect_fingerprint.is_none() {
-                eprintln!("  Verify it matches what the host shows (freedomdesk id on the host).");
+            let aliases = kh.labels_for(&session.remote_public);
+            if !aliases.is_empty() {
+                eprintln!("Host key already pinned as: {} (same machine, new name).", aliases.join(", "));
             }
+            if args.expect_fingerprint.is_none() && aliases.is_empty() && !args.trust_new {
+                eprintln!("First connection to {label}. Host fingerprint:\n\n    {host_fp}\n");
+                eprintln!("Compare it with `freedomdesk id` on the host (read it out over the phone).");
+                if !confirm("Trust this host and remember its key? [y/N] ")? {
+                    bail!("not trusted; nothing was sent to the host (use --expect-fingerprint or --trust-new)");
+                }
+            }
+            kh.pin(&label, &session.remote_public)?;
+            eprintln!("Pinned {label} = {host_fp}");
         }
         PinCheck::Mismatch { pinned_fingerprint } => bail!(
             "HOST KEY CHANGED for {label}!\n  pinned:    {pinned_fingerprint}\n  presented: {host_fp}\n\
@@ -115,6 +126,7 @@ fn connect(dir: &Path, args: &ViewArgs) -> Result<Connected> {
     session.reader.set_timeout(None)?;
     match reply {
         HostMsg::Welcome { protocol, host_name, screen_width, screen_height, video_width, video_height } => {
+            let host_name = clean(&host_name);
             if protocol != PROTOCOL_VERSION {
                 bail!("host speaks protocol {protocol}, we speak {PROTOCOL_VERSION}");
             }
@@ -127,9 +139,26 @@ fn connect(dir: &Path, args: &ViewArgs) -> Result<Connected> {
                 video_size: (video_width, video_height),
             })
         }
-        HostMsg::Denied { reason } => bail!("host denied the session: {reason}"),
+        HostMsg::Denied { reason } => bail!("host denied the session: {}", clean(&reason)),
         other => bail!("unexpected first message from host: {other:?}"),
     }
+}
+
+/// Ask a yes/no question on the terminal. Non-interactive stdin = no.
+fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+fn clean(s: &str) -> String {
+    crate::consent::sanitize(s, 120)
 }
 
 fn now_us(t0: Instant) -> u64 {
@@ -175,6 +204,53 @@ struct Stats {
     rtt_ms: Option<f64>,
 }
 
+/// Decoder that, after an error, drops P-frames until a keyframe arrives and
+/// rate-limits keyframe requests (no request storms on a lossy link).
+struct GatedDecoder {
+    dec: fd_codec::VideoDecoder,
+    need_keyframe: bool,
+    last_request: Option<Instant>,
+}
+
+const MAX_DIM: u32 = 8192;
+
+impl GatedDecoder {
+    fn new() -> Result<Self> {
+        Ok(Self { dec: fd_codec::VideoDecoder::new()?, need_keyframe: false, last_request: None })
+    }
+
+    fn decode(&mut self, data: &[u8], keyframe: bool, tx: &Sender<ViewerMsg>) -> Option<fd_codec::DecodedFrame> {
+        if self.need_keyframe && !keyframe {
+            self.request(tx);
+            return None;
+        }
+        match self.dec.decode(data) {
+            Ok(Some(f)) if f.width <= MAX_DIM && f.height <= MAX_DIM => {
+                self.need_keyframe = false;
+                Some(f)
+            }
+            Ok(Some(f)) => {
+                log::warn!("ignoring oversized picture {}x{}", f.width, f.height);
+                None
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!("decode: {e:#}; waiting for keyframe");
+                self.need_keyframe = true;
+                self.request(tx);
+                None
+            }
+        }
+    }
+
+    fn request(&mut self, tx: &Sender<ViewerMsg>) {
+        if self.last_request.is_none_or(|t| t.elapsed() >= Duration::from_millis(500)) {
+            self.last_request = Some(Instant::now());
+            let _ = tx.send(ViewerMsg::RequestKeyframe);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- headless
 
 fn headless(conn: Connected, want: u64) -> Result<()> {
@@ -184,7 +260,7 @@ fn headless(conn: Connected, want: u64) -> Result<()> {
     let wt = spawn_writer(conn.writer, rx, t0);
     let mut reader = conn.reader;
     reader.set_timeout(Some(Duration::from_secs(10)))?;
-    let mut dec = fd_codec::VideoDecoder::new()?;
+    let mut dec = GatedDecoder::new()?;
     let mut st = Stats::default();
     let mut dims = (0, 0);
     let start = Instant::now();
@@ -192,23 +268,16 @@ fn headless(conn: Connected, want: u64) -> Result<()> {
     while st.frames < want {
         let msg: HostMsg = fd_proto::decode(&reader.recv()?)?;
         match msg {
-            HostMsg::Video { data, .. } => {
+            HostMsg::Video { data, keyframe, .. } => {
                 st.bytes += data.len() as u64;
-                match dec.decode(&data) {
-                    Ok(Some(f)) => {
-                        dims = (f.width, f.height);
-                        st.frames += 1;
-                        first_frame.get_or_insert_with(|| start.elapsed());
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        log::warn!("decode: {e:#}; requesting keyframe");
-                        let _ = tx.send(ViewerMsg::RequestKeyframe);
-                    }
+                if let Some(f) = dec.decode(&data, keyframe, &tx) {
+                    dims = (f.width, f.height);
+                    st.frames += 1;
+                    first_frame.get_or_insert_with(|| start.elapsed());
                 }
             }
             HostMsg::Pong { ts_us } => st.rtt_ms = Some((now_us(t0).saturating_sub(ts_us)) as f64 / 1000.0),
-            HostMsg::Bye { reason } => bail!("host ended session: {reason}"),
+            HostMsg::Bye { reason } => bail!("host ended session: {}", clean(&reason)),
             other => log::debug!("ignoring {other:?}"),
         }
     }
@@ -245,32 +314,25 @@ struct Latest {
 fn spawn_reader(mut reader: SecureReader, latest: Arc<Mutex<Latest>>, tx: Sender<ViewerMsg>, ctx: egui::Context, t0: Instant) {
     std::thread::spawn(move || {
         let result = (|| -> Result<String> {
-            let mut dec = fd_codec::VideoDecoder::new()?;
+            let mut dec = GatedDecoder::new()?;
             loop {
                 let msg: HostMsg = fd_proto::decode(&reader.recv()?)?;
                 match msg {
-                    HostMsg::Video { data, .. } => {
+                    HostMsg::Video { data, keyframe, .. } => {
                         let n = data.len() as u64;
-                        match dec.decode(&data) {
-                            Ok(Some(f)) => {
-                                let mut l = latest.lock().unwrap();
-                                l.frame = Some(f);
-                                l.stats.frames += 1;
-                                l.stats.bytes += n;
-                                drop(l);
-                                ctx.request_repaint();
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                log::warn!("decode: {e:#}; requesting keyframe");
-                                let _ = tx.send(ViewerMsg::RequestKeyframe);
-                            }
+                        if let Some(f) = dec.decode(&data, keyframe, &tx) {
+                            let mut l = latest.lock().unwrap();
+                            l.frame = Some(f);
+                            l.stats.frames += 1;
+                            l.stats.bytes += n;
+                            drop(l);
+                            ctx.request_repaint();
                         }
                     }
                     HostMsg::Pong { ts_us } => {
                         latest.lock().unwrap().stats.rtt_ms = Some(now_us(t0).saturating_sub(ts_us) as f64 / 1000.0);
                     }
-                    HostMsg::Bye { reason } => return Ok(reason),
+                    HostMsg::Bye { reason } => return Ok(clean(&reason)),
                     other => log::debug!("ignoring {other:?}"),
                 }
             }
@@ -294,7 +356,9 @@ struct Mods {
 
 impl From<egui::Modifiers> for Mods {
     fn from(m: egui::Modifiers) -> Self {
-        Self { shift: m.shift, ctrl: m.ctrl, alt: m.alt, sup: m.mac_cmd }
+        // macOS Cmd acts as Ctrl on the (Linux/Windows) host, so Cmd+C/V/T do what a Mac user expects.
+        // Super isn't reported by egui on Linux/Windows; reserved for a future "send Super" toolbar action.
+        Self { shift: m.shift, ctrl: m.ctrl || m.mac_cmd, alt: m.alt, sup: false }
     }
 }
 
@@ -392,13 +456,17 @@ impl ViewerApp {
                         self.send(InputEvent::Scroll { dx: dx as i16, dy: dy as i16 });
                     }
                 }
-                egui::Event::Key { key, pressed, modifiers, .. } => {
+                // Only modifiers are ever *held* on the host. Every other key is a
+                // press+release tap on key-down (and on each auto-repeat), and
+                // key-ups are ignored: no stuck keys if Ctrl is released first or
+                // the link stalls, and no double auto-repeat.
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
                     self.sync_mods(modifiers.into());
                     let shortcut = modifiers.ctrl || modifiers.alt || modifiers.mac_cmd;
                     if let Some(ks) = keymap::special(key) {
-                        self.send(InputEvent::Key { keysym: ks, down: pressed });
+                        self.tap(ks);
                     } else if let Some(ks) = keymap::character(key).filter(|_| shortcut) {
-                        self.send(InputEvent::Key { keysym: ks, down: pressed });
+                        self.tap(ks);
                     }
                 }
                 egui::Event::Text(t) => {

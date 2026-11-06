@@ -20,9 +20,15 @@ pub struct ConsentArgs {
     timeout: u64,
 }
 
-/// Strip control characters and bound length of peer-supplied text before display.
+/// Strip control, bidi-override and zero-width characters and bound the length
+/// of peer-supplied text before showing it to anyone (dialog, terminal, title).
 pub fn sanitize(s: &str, max: usize) -> String {
-    s.chars().filter(|c| !c.is_control()).take(max).collect()
+    s.chars().filter(|c| !c.is_control() && !is_invisible_format(*c)).take(max).collect()
+}
+
+fn is_invisible_format(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x061C | 0x180E | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)
 }
 
 /// Ask the local user. Blocks until answered or `timeout` elapses.
@@ -78,8 +84,9 @@ impl eframe::App for Dialog {
             ui.add_space(8.0);
             ui.heading("Remote access request");
             ui.add_space(8.0);
-            ui.label(format!("“{}” wants to SEE and CONTROL this computer.", self.args.name));
-            ui.label(format!("From: {}", self.args.peer));
+            ui.label("Someone wants to SEE and CONTROL this computer.");
+            ui.label(format!("Name they gave (not verified): “{}”", self.args.name));
+            ui.label(format!("Network address: {}", self.args.peer));
             ui.label("Their device fingerprint:");
             ui.monospace(&self.args.fingerprint);
             ui.add_space(8.0);
@@ -111,7 +118,7 @@ pub fn run(args: ConsentArgs) -> Result<()> {
     let opts = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("FreedomDesk — allow remote access?")
-            .with_inner_size([460.0, 280.0])
+            .with_inner_size([480.0, 300.0])
             .with_always_on_top()
             .with_resizable(false),
         ..Default::default()
