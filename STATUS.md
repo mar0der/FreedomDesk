@@ -5,7 +5,7 @@ _Last updated: 2026-11-06 ~10:55 Dubai (PO `freedomdesk-po`)_
 ## Now
 - **T2 PASSED** (Guardian, headless): the20th → the21th over Tailscale, first frame 160 ms, rtt 1.5 ms. GUI input path still needs a human check.
 - **Host live on the21th**: `~/.local/bin/freedomdesk host --bind 100.116.143.66 --port 47801` (setsid, log `~/.local/state/freedomdesk/host.log`), FP `L4O7-LFLS-PTVE-HW7U-RR6P-VZWO`. Unattended viewers in `~/.config/freedomdesk/authorized_viewers` (the20th listed); add with `freedomdesk authorize <FP>`.
-- **T3 (Petar's MacBook, aarch64 viewer) in progress**: CI builds macOS arm64 + Linux on every push; a `v*` tag publishes a pre-release. Or `cargo build` on the Mac. Steps: `docs/TESTING.md` §T3.
+- **T3 ready for Petar**: macOS arm64 viewer released — https://github.com/mar0der/FreedomDesk/releases/tag/v0.1.0-alpha.1 (5.8 MB, checksum verified). Or `cargo build` on the Mac. Steps: `docs/TESTING.md` §T3. CI builds Linux + macOS on every push; `v*` tags publish pre-releases.
 - CI: https://github.com/mar0der/FreedomDesk/actions
 
 ## Milestones (SPEC §9, refined)
@@ -36,7 +36,7 @@ _Last updated: 2026-11-06 ~10:55 Dubai (PO `freedomdesk-po`)_
 - Consent dialog isn't killed if the viewer disconnects mid-prompt.
 
 ## Blocked / needs Petar
-- T3: run the Mac viewer (docs/TESTING.md §T3) and report. Releases: tag `v0.1.0-alpha.1` publishes public binaries — PO will tag once CI is green unless Petar says otherwise.
+- T3: run the Mac viewer (docs/TESTING.md §T3): `freedomdesk id` on the Mac → `ssh the21th ~/.local/bin/freedomdesk authorize <FP>` → `freedomdesk view 100.116.143.66 --expect-fingerprint L4O7-LFLS-PTVE-HW7U-RR6P-VZWO`. Report what works/doesn't (esp. keyboard).
 - Host is a plain setsid process (no autostart on reboot) — systemd user unit comes with M4.
 
 ## Notes

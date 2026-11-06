@@ -50,11 +50,11 @@ macOS permissions (it doesn't capture or inject anything locally).
   cargo build --release -p freedomdesk --locked
   cp target/release/freedomdesk ~/bin/   # or run it in place
   ```
-- **Or download a release** (when a `v*` tag exists). Use curl, not the browser, so
+- **Or download the release** (pre-release `v0.1.0-alpha.1`; newer tags: see the Releases page). Use curl, not the browser, so
   Gatekeeper doesn't quarantine the unsigned binary:
   ```
-  curl -LO https://github.com/mar0der/FreedomDesk/releases/latest/download/freedomdesk-macos-aarch64.tar.gz
-  curl -LO https://github.com/mar0der/FreedomDesk/releases/latest/download/freedomdesk-macos-aarch64.tar.gz.sha256
+  curl -LO https://github.com/mar0der/FreedomDesk/releases/download/v0.1.0-alpha.1/freedomdesk-macos-aarch64.tar.gz
+  curl -LO https://github.com/mar0der/FreedomDesk/releases/download/v0.1.0-alpha.1/freedomdesk-macos-aarch64.tar.gz.sha256
   shasum -a 256 -c freedomdesk-macos-aarch64.tar.gz.sha256 && tar xzf freedomdesk-macos-aarch64.tar.gz
   ```
 
