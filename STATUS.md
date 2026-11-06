@@ -36,7 +36,7 @@ _Last updated: 2026-11-06 ~10:45 Dubai (PO `freedomdesk-po`)_
 - Consent dialog isn't killed if the viewer disconnects mid-prompt.
 
 ## Blocked / needs Petar
-1. **Push**: the21th has no GitHub credentials (`gh auth login` or a deploy key needed). 4 commits on local `main`, not pushed.
+1. **Push**: the21th has no GitHub credentials (`gh auth login` or a deploy key needed). 5 commits on local `main`, not pushed.
 2. **T2/T3**: no SSH from the21th → the20th (the21th has no SSH keypair at all). Either OK me to generate one and you add it to the20th, or run the viewer yourself: `git clone the21th:Developer/FreedomDesk && cargo build --release -p freedomdesk`, then follow `docs/TESTING.md`.
 
 ## Notes
