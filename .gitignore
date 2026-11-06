@@ -1,0 +1,16 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+*.log
+.env
+.env.*
+!.env.example
+/dist/
+/release/
+*.pdb
+*.dSYM/
