@@ -71,6 +71,9 @@ const HELLO_MAX: usize = 4096;
 const PROMPT_COOLDOWN: Duration = Duration::from_secs(60);
 
 pub fn run(dir: &Path, args: HostArgs) -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!("hosting is Linux-only for now (macOS/Windows hosts are milestone M7); this build can view other machines");
+    }
     let identity = load_identity(dir)?;
     let addr = netpolicy::resolve_bind(args.bind.as_deref(), args.port, args.allow_public_bind)?;
     let listener = TcpListener::bind(addr).with_context(|| format!("listening on {addr}"))?;
@@ -544,10 +547,21 @@ fn unix_time() -> u64 {
 }
 
 pub fn hostname() -> String {
+    let from_cmd = || {
+        // macOS/Windows have no /etc/hostname; `hostname` exists on all three.
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
     std::fs::read_to_string("/etc/hostname")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(from_cmd)
+        .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok())
+        .map(|s| crate::consent::sanitize(&s, 64))
         .unwrap_or_else(|| "freedomdesk-host".into())
 }
