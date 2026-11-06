@@ -54,6 +54,8 @@ struct Shared {
     busy: AtomicBool,
     /// Set by SIGINT/SIGTERM: every session winds down (releasing held keys).
     shutting_down: AtomicBool,
+    /// Socket of the active session, so a signal can unblock its threads.
+    active_socket: Mutex<Option<fd_crypto::ShutdownHandle>>,
     /// Connections that have not yet been authorised (handshake / Hello / consent).
     pre_auth: AtomicUsize,
     /// After a denied/timed-out prompt, no new prompts for this IP until the instant.
@@ -87,6 +89,7 @@ pub fn run(dir: &Path, args: HostArgs) -> Result<()> {
         audit_path: dir.join("audit.log"),
         busy: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
+        active_socket: Mutex::new(None),
         pre_auth: AtomicUsize::new(0),
         prompt_cooldown: Mutex::new(HashMap::new()),
     });
@@ -98,6 +101,11 @@ pub fn run(dir: &Path, args: HostArgs) -> Result<()> {
                 std::process::exit(130); // second signal: give up waiting
             }
             log::info!("stopping …");
+            if let Ok(g) = shared.active_socket.lock() {
+                if let Some(h) = g.as_ref() {
+                    h.shutdown(); // unblocks send/recv; input thread then releases held keys
+                }
+            }
             let deadline = Instant::now() + Duration::from_secs(3);
             while shared.busy.load(Ordering::SeqCst) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
@@ -276,6 +284,9 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
 
     let Session { mut reader, writer, .. } = session;
     let shutdown = writer.shutdown_handle()?;
+    if let Ok(mut g) = shared.active_socket.lock() {
+        *g = Some(writer.shutdown_handle()?);
+    }
     let writer = Arc::new(Mutex::new(writer));
     let send = |msg: &HostMsg| -> Result<()> {
         let bytes = fd_proto::encode(msg)?;
@@ -374,7 +385,19 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                         }
                         Ok(None) => {}
                         Err(e) if e.downcast_ref::<fd_capture::ScreenResized>().is_some() => {
-                            capturer = fd_capture::open_default().context("reopening capture after resize")?;
+                            // xrandr may still be mid-change: retry briefly.
+                            let mut tries = 0;
+                            capturer = loop {
+                                match fd_capture::open_default() {
+                                    Ok(c) => break c,
+                                    Err(e) if tries < 10 => {
+                                        tries += 1;
+                                        log::debug!("reopen capture: {e:#}; retrying");
+                                        std::thread::sleep(Duration::from_millis(200));
+                                    }
+                                    Err(e) => return Err(e.context("reopening capture after resize")),
+                                }
+                            };
                             let (w, h) = capturer.size();
                             converter = fd_codec::Converter::new(w, h, &cfg)?;
                             screen_size.store(pack(w, h), Ordering::Relaxed);
@@ -404,6 +427,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
     let mut seq = 0u64;
     let mut encoder: Option<(fd_codec::VideoEncoder, (u32, u32))> = None;
     let mut last: Option<Pic> = None;
+    let mut kf_retries = 0u32;
     let video_result = (|| -> Result<()> {
         loop {
             if stop.load(Ordering::SeqCst) || shared.shutting_down.load(Ordering::SeqCst) {
@@ -440,6 +464,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
             let (enc, _) = encoder.as_mut().expect("encoder just set");
             match enc.encode_i420(&pic.pic, kf)? {
                 Some(out) => {
+                    kf_retries = 0;
                     seq += 1;
                     send(&HostMsg::Video {
                         seq,
@@ -448,7 +473,11 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                         data: out.data,
                     })?;
                 }
-                None if kf => want_keyframe.store(true, Ordering::Relaxed), // rate control skipped it
+                // Rate control skipped the forced IDR: retry a few times, not forever.
+                None if kf && kf_retries < 5 => {
+                    kf_retries += 1;
+                    want_keyframe.store(true, Ordering::Relaxed);
+                }
                 None => {}
             }
         }
@@ -460,6 +489,9 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         let _ = send(&HostMsg::Bye { reason: "host ended session".into() });
     }
     shutdown.shutdown();
+    if let Ok(mut g) = shared.active_socket.lock() {
+        *g = None;
+    }
     let input_result = input_thread.join().map_err(|_| anyhow!("input thread panicked"))?;
     log::info!("session with {viewer_name} ended after {seq} frames");
     // A viewer hanging up shows up as a read error on the input thread; that's a normal end.

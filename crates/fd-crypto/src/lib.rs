@@ -30,6 +30,7 @@ const CHUNK_PAYLOAD: usize = MAX_NOISE_MSG - TAG_LEN - 1;
 /// Largest application message we will reassemble (anti memory-DoS).
 pub const MAX_APP_MSG: usize = 32 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------- identity
 
@@ -216,7 +217,9 @@ fn run_handshake(mut stream: TcpStream, mut hs: HandshakeState, initiator: bool)
         hs.into_stateless_transport_mode().map_err(|e| anyhow!("noise transport: {e}"))?,
     );
     stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
+    // A peer that stops reading (laptop asleep, path gone) must not block a sender
+    // forever while it holds locks: fail the write and end the session instead.
+    stream.set_write_timeout(Some(SEND_TIMEOUT))?;
     let read_stream = stream.try_clone()?;
     Ok(Session {
         reader: SecureReader { stream: read_stream, transport: transport.clone(), nonce: 0 },
@@ -359,8 +362,13 @@ fn read_frame(stream: &mut TcpStream, deadline: Option<Instant>) -> Result<Vec<u
 /// `read_exact`, but with an absolute deadline across all the underlying reads.
 fn read_exact_by(stream: &mut TcpStream, buf: &mut [u8], deadline: Option<Instant>) -> Result<()> {
     let Some(deadline) = deadline else {
-        stream.read_exact(buf)?;
-        return Ok(());
+        return stream.read_exact(buf).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                anyhow::Error::new(e).context("connection closed by the other side")
+            } else {
+                e.into()
+            }
+        });
     };
     let saved = stream.read_timeout()?;
     let r = read_exact_deadline(stream, buf, deadline);

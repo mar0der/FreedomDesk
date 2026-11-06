@@ -15,7 +15,7 @@ PORT=${PORT:-47899}
 cargo build --profile "$PROFILE" -p freedomdesk -q
 BIN=target/$([[ $PROFILE == dev ]] && echo debug || echo "$PROFILE")/freedomdesk
 TMP=$(mktemp -d)
-trap 'kill $HOST_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
+trap 'kill $HOST_PID 2>/dev/null; wait $HOST_PID 2>/dev/null; rm -rf "$TMP"' EXIT
 HOST_FP=$($BIN --config-dir "$TMP/host" id | awk '/fingerprint/{print $3}')
 VIEW_FP=$($BIN --config-dir "$TMP/viewer" id | awk '/fingerprint/{print $3}')
 RUST_LOG=${RUST_LOG:-warn} $BIN --config-dir "$TMP/host" host --bind 127.0.0.1 --port "$PORT" \
