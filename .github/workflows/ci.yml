@@ -40,7 +40,7 @@ jobs:
 
   macos:
     name: macOS aarch64 (viewer)
-    runs-on: macos-14
+    runs-on: macos-latest  # Apple Silicon
     steps:
       - uses: actions/checkout@v4
       - name: System deps

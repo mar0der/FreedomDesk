@@ -51,6 +51,7 @@ struct Shared {
     identity: fd_crypto::Identity,
     host_name: String,
     audit_path: PathBuf,
+    config_dir: PathBuf,
     busy: AtomicBool,
     /// Set by SIGINT/SIGTERM: every session winds down (releasing held keys).
     shutting_down: AtomicBool,
@@ -84,12 +85,17 @@ pub fn run(dir: &Path, args: HostArgs) -> Result<()> {
     if !args.unattended.is_empty() {
         println!("Unattended viewers (no consent prompt): {}", args.unattended.join(", "));
     }
+    let listed = crate::authorized::load(dir);
+    if !listed.is_empty() {
+        println!("Authorised viewers file: {} entr{} (re-read on each connection)", listed.len(), if listed.len() == 1 { "y" } else { "ies" });
+    }
     let once = args.once;
     let shared = Arc::new(Shared {
         args,
         identity,
         host_name,
         audit_path: dir.join("audit.log"),
+        config_dir: dir.to_path_buf(),
         busy: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
         active_socket: Mutex::new(None),
@@ -179,11 +185,8 @@ fn handle(shared: &Shared, stream: TcpStream) -> Result<()> {
         return Ok(());
     }
 
-    let unattended = shared
-        .args
-        .unattended
-        .iter()
-        .any(|a| normalize_fingerprint(a) == normalize_fingerprint(&fp));
+    let unattended = shared.args.unattended.iter().any(|a| normalize_fingerprint(a) == normalize_fingerprint(&fp))
+        || crate::authorized::lookup(&shared.config_dir, &fp).is_some();
     if !unattended {
         let mut cd = shared.prompt_cooldown.lock().map_err(|_| anyhow!("poisoned"))?;
         cd.retain(|_, until| *until > Instant::now());

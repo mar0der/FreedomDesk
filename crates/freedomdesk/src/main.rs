@@ -1,5 +1,6 @@
 //! FreedomDesk — one binary that is both host agent and viewer.
 
+mod authorized;
 mod consent;
 mod host;
 mod keymap;
@@ -30,6 +31,8 @@ enum Cmd {
     Host(host::HostArgs),
     /// Connect to a host and view/control it.
     View(viewer::ViewArgs),
+    /// Allow a viewer to connect to this host without a consent prompt (unattended).
+    Authorize(authorized::AuthorizeArgs),
     /// (internal) Show the host-side consent dialog. Exit code 0 = allowed.
     #[command(hide = true)]
     Consent(consent::ConsentArgs),
@@ -64,6 +67,7 @@ fn main() -> Result<()> {
         }
         Cmd::Host(a) => host::run(&dir, a),
         Cmd::View(a) => viewer::run(&dir, a),
+        Cmd::Authorize(a) => authorized::run(&dir, a),
         Cmd::Consent(a) => consent::run(a),
     }
 }
