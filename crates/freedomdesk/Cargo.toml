@@ -1,0 +1,19 @@
+[package]
+name = "freedomdesk"
+description = "FreedomDesk: open-source remote desktop (host + viewer)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+directories.workspace = true
+eframe.workspace = true
+fd-proto.workspace = true
+fd-crypto.workspace = true
+fd-capture.workspace = true
+fd-codec.workspace = true
+fd-input.workspace = true

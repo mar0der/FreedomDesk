@@ -1,0 +1,15 @@
+[package]
+name = "fd-capture"
+description = "FreedomDesk screen capture (X11 now; PipeWire/macOS/Windows later)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb.workspace = true
+libc.workspace = true

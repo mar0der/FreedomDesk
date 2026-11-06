@@ -1,0 +1,14 @@
+[package]
+name = "fd-crypto"
+description = "FreedomDesk identity, Noise_XX secure channel and key pinning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+snow.workspace = true
+sha2.workspace = true
+data-encoding.workspace = true
+zeroize.workspace = true
