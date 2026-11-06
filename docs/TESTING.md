@@ -38,6 +38,39 @@ A consent dialog appears on the21th → **Allow**. Then check:
 Unattended (skip the dialog for a known viewer): on the viewer run `freedomdesk id`, then
 `freedomdesk host --unattended-viewer <VIEWER-FP>` on the host.
 
-## T3 — MacBook viewer
-Same as T2 from macOS (`cargo build --release -p freedomdesk`; the host-side crates
-compile to "unsupported" stubs on macOS, viewer works).
+## T3 — Petar's MacBook Air (Apple Silicon) viewer → the21th
+
+The Mac build is **viewer-only** (`host` says "Linux-only for now"). The viewer needs no
+macOS permissions (it doesn't capture or inject anything locally).
+
+**Get the binary** — either:
+- **Build on the Mac** (Rust ≥ 1.89; nasm not needed):
+  ```
+  git clone https://github.com/mar0der/FreedomDesk && cd FreedomDesk
+  cargo build --release -p freedomdesk --locked
+  cp target/release/freedomdesk ~/bin/   # or run it in place
+  ```
+- **Or download a release** (when a `v*` tag exists). Use curl, not the browser, so
+  Gatekeeper doesn't quarantine the unsigned binary:
+  ```
+  curl -LO https://github.com/mar0der/FreedomDesk/releases/latest/download/freedomdesk-macos-aarch64.tar.gz
+  curl -LO https://github.com/mar0der/FreedomDesk/releases/latest/download/freedomdesk-macos-aarch64.tar.gz.sha256
+  shasum -a 256 -c freedomdesk-macos-aarch64.tar.gz.sha256 && tar xzf freedomdesk-macos-aarch64.tar.gz
+  ```
+
+**Authorise the Mac on the host** (once — so nobody has to click Allow on the21th):
+```
+./freedomdesk id                                   # on the Mac: note "Device fingerprint"
+ssh the21th ~/.local/bin/freedomdesk authorize <MAC-FP> --label petar-macbook
+```
+(Without this, the21th shows an Allow/Deny dialog and auto-denies after 30 s.)
+
+**Connect:**
+```
+./freedomdesk view 100.116.143.66 --expect-fingerprint L4O7-LFLS-PTVE-HW7U-RR6P-VZWO
+```
+Checklist: same as T2, plus Mac specifics —
+- [ ] Cmd+C / Cmd+V / Cmd+T act as Ctrl+C / Ctrl+V / Ctrl+T on the Linux host
+- [ ] trackpad scrolling (both axes) and two-finger right click
+- [ ] Retina scaling: pointer lands exactly where clicked
+- [ ] known gap: Option+key special characters are not forwarded yet

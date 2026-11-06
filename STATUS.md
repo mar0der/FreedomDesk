@@ -1,19 +1,19 @@
 # STATUS — FreedomDesk PO (the21th)
 
-_Last updated: 2026-11-06 ~10:45 Dubai (PO `freedomdesk-po`)_
+_Last updated: 2026-11-06 ~10:55 Dubai (PO `freedomdesk-po`)_
 
 ## Now
-- **P0 code complete on the21th, T1 green.** `freedomdesk host|view|id`: X11 capture (SHM, cursor, DAMAGE) → OpenH264 → Noise_XX/TCP → egui viewer with mouse + keyboard (XKB-aware, Cyrillic OK).
-- T1 loopback: 20× reconnect, pin-mismatch refusal, SIGTERM clean stop — pass. GUI viewer checked in nested Xephyr.
-- Perf (3840×2160 → 1080p, asm): capture 7–11 ms, convert 6 ms, encode 18–24 ms, decode 8 ms; 2-thread pipeline 35 fps busy / idle screen sends nothing.
-- **Waiting on Petar for T2/T3** (the20th / MacBook viewer) — see Blocked.
+- **T2 PASSED** (Guardian, headless): the20th → the21th over Tailscale, first frame 160 ms, rtt 1.5 ms. GUI input path still needs a human check.
+- **Host live on the21th**: `~/.local/bin/freedomdesk host --bind 100.116.143.66 --port 47801` (setsid, log `~/.local/state/freedomdesk/host.log`), FP `L4O7-LFLS-PTVE-HW7U-RR6P-VZWO`. Unattended viewers in `~/.config/freedomdesk/authorized_viewers` (the20th listed); add with `freedomdesk authorize <FP>`.
+- **T3 (Petar's MacBook, aarch64 viewer) in progress**: CI builds macOS arm64 + Linux on every push; a `v*` tag publishes a pre-release. Or `cargo build` on the Mac. Steps: `docs/TESTING.md` §T3.
+- CI: https://github.com/mar0der/FreedomDesk/actions
 
 ## Milestones (SPEC §9, refined)
 | M | Goal | Exit criteria | State |
 |---|------|---------------|-------|
 | M0 | Docs + PO online | SPEC, repo, PO running | ✅ |
 | M1 | Capture → encode → decode loop | loopback decode on the21th + bench | ✅ |
-| M2 | Networked P0 | the21th ↔ the20th over Tailscale, terminal + browser usable | 🔨 code ✅, T2 pending |
+| M2 | Networked P0 | the21th ↔ the20th over Tailscale, terminal + browser usable | 🔨 T2 headless ✅; GUI input + T3 Mac pending |
 | M3 | Crypto + consent + IDs | Noise_XX, fingerprints, TOFU+confirm, consent dialog, audit log, DoS limits ✅; left: glass-to-glass latency measurement | 🔨 |
 | M4 | Unattended + join code | systemd user service, authorized-viewers file, join code; Wayland/PipeWire capture + portal input | ⏳ next |
 | M5 | Clipboard, files, multi-monitor | P1-3/4/5 | ⏳ |
@@ -36,8 +36,8 @@ _Last updated: 2026-11-06 ~10:45 Dubai (PO `freedomdesk-po`)_
 - Consent dialog isn't killed if the viewer disconnects mid-prompt.
 
 ## Blocked / needs Petar
-1. **Push**: the21th has no GitHub credentials (`gh auth login` or a deploy key needed). 5 commits on local `main`, not pushed.
-2. **T2/T3**: no SSH from the21th → the20th (the21th has no SSH keypair at all). Either OK me to generate one and you add it to the20th, or run the viewer yourself: `git clone the21th:Developer/FreedomDesk && cargo build --release -p freedomdesk`, then follow `docs/TESTING.md`.
+- T3: run the Mac viewer (docs/TESTING.md §T3) and report. Releases: tag `v0.1.0-alpha.1` publishes public binaries — PO will tag once CI is green unless Petar says otherwise.
+- Host is a plain setsid process (no autostart on reboot) — systemd user unit comes with M4.
 
 ## Notes
 - Do not disturb `freedomoffice-claude` or `the21th-claude`.
