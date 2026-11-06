@@ -74,3 +74,7 @@ Checklist: same as T2, plus Mac specifics —
 - [ ] trackpad scrolling (both axes) and two-finger right click
 - [ ] Retina scaling: pointer lands exactly where clicked
 - [ ] known gap: Option+key special characters are not forwarded yet
+- [ ] cursor follows the trackpad instantly (drawn locally, remote shape: arrow / I-beam / hand)
+- [ ] zoom: pinch, Ctrl+Option+scroll, Ctrl+Option+1 (1:1), Ctrl+Option+0 (fit), toolbar at the top edge
+- [ ] zoomed in, 4K text is sharp (host crops natively); edge-pan by moving to the window edge
+- [ ] clicks land exactly under the cursor at fit, 1:1 and 400%

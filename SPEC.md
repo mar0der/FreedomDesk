@@ -341,4 +341,26 @@ FreedomDesk includes a **network service** (rendezvous/relay). Under MIT/Apache,
 
 ---
 
+## 16. Headless machines, login/lock screen, agent access (added 2026-11-07)
+
+Petar's requirement: monitor-less machines (the20th, the21th, a future Mac mini, the MacBook Air at home) must be fully operable remotely, **including the prompts that normally need someone at the machine**: GDM greeter, lock screen, polkit, macOS login window, admin password and privacy (TCC) prompts. AI agents (Claude Code, Guardian) must be able to screenshot/click/type on these machines through the same encrypted channel, using their own keys with scoped permissions, an on-screen indicator, a kill switch and an audit log.
+
+Full research and design: [`docs/design/headless-login-agents.md`](docs/design/headless-login-agents.md) (sourced). Key points:
+- **Process split:** a minimal privileged daemon (listener, auth, policy, audit) follows the active console session and spawns a per-session capture/input agent inside it (greeter, user session, lock screen).
+- **Linux now:** X11 everywhere (GDM greeter on Xorg via `WaylandEnable=false`, NVIDIA fixed-mode/EDID config for no-monitor operation). Greeter, lock screen and polkit dialogs are then ordinary pixels to the existing capture/XTest path. **Wayland** (mandatory from Ubuntu 26.04) needs a spike: Mutter D-Bus RemoteDesktop/ScreenCast vs portal vs bridging gnome-remote-desktop.
+- **macOS:** LaunchDaemon + LoginWindow LaunchAgent (supported design on 14.4+). Hard limits Apple imposes: synthetic clicks are ignored on TCC/security "Allow" buttons; Screen Recording cannot be pre-granted without a click or MDM; FileVault pre-boot is unreachable except SSH unlock on macOS 26 (Apple Silicon). Each Mac needs one provisioning visit **or** self-hosted MDM.
+- **Agent access:** `freedomdesk mcp` (stdio MCP server) and `freedomdesk act <screenshot|click|type|key|scroll|...>`, mirroring Anthropic computer-use tool actions, authenticated as an agent key.
+- **Permissions:** `authorized_viewers` v2 gains per-key scopes (`view`, `control`, `login`, `kind=agent`, `until=`), plus `freedomdesk kill` / `revoke`. Agents never get `login` by default.
+
+| # | Milestone | Exit criteria (abridged) |
+|---|-----------|--------------------------|
+| H1 | Headless X11 display + Linux greeter/lock | the21th with TV unplugged boots to a GDM greeter visible and usable from the viewer; lock/unlock and a polkit prompt answered remotely; same on the20th |
+| H2 | Root daemon + per-session agent | greeter → login → logout with no manual reconnect; survives reboot; fuzzed pre-auth |
+| H3 | Scoped permissions + kill/revoke | view-only key can't inject; no-`login` key can't see the greeter; kill < 1 s |
+| H4 | Agent access (MCP + CLI) | Claude Code on the20th drives a terminal on the21th via `freedomdesk mcp`; indicator + per-action audit |
+| H5 | Wayland decision + implementation | spike report, then chosen backend before any box moves to 26.04 |
+| H6 | macOS headless host (with M7) | Mac mini on a dummy plug: login window, lock screen, admin prompt usable remotely; provisioning checklist |
+
+---
+
 _End of SPEC v0.1 — PO should treat this as living; update STATUS.md when milestones move._
