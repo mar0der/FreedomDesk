@@ -1,5 +1,6 @@
 //! Capture -> convert -> encode -> decode benchmark against the live display.
 //!
+//! cargo run --release -p fd-codec --example bench -- crops [frames=60]
 //! cargo run --release -p fd-codec --example bench -- [frames=120] [max_w=1920] [max_h=1080] [kbps=6000] [threads=1] [busy=0] [screen=1]
 //!
 //! `busy=1` paints a moving 800x600 pattern into each captured frame (outside the timed
@@ -36,7 +37,92 @@ fn paint_busy(f: &mut Frame, i: u32) {
     }
 }
 
+/// `bench crops [frames]`: viewer-zoom scenarios (crop of the live screen -> convert -> encode
+/// -> decode), per-stage averages.
+fn crops(n: u32) -> anyhow::Result<()> {
+    let mut cap = fd_capture::open_default()?;
+    cap.set_draw_cursor(false);
+    let (sw, sh) = cap.size();
+    // (label, crop w, crop h, max w, max h); crops are centred.
+    let cases = [
+        ("full -> 1920x1080", sw, sh, 1920, 1080),
+        ("full -> 1600x900", sw, sh, 1600, 900),
+        ("full -> 1280x720", sw, sh, 1280, 720),
+        ("crop 1920x1080 1:1", 1920, 1080, 1920, 1080),
+        ("crop 2560x1440 -> 1600x900", 2560, 1440, 1600, 900),
+        ("crop 1280x720 1:1", 1280, 720, 1280, 720),
+        ("crop 1001x667 -> 640x426", 1001, 667, 640, 640),
+    ];
+    println!("source {sw}x{sh}, {n} frames per case (screen-content encoder, 6 Mbps)");
+    println!(
+        "{:<28} {:>9} {:>6} {:>8} {:>8} {:>8} {:>8} {:>9}",
+        "case", "out", "kind", "capture", "convert", "encode", "decode", "KB/frame"
+    );
+    for (label, cw, ch, mw, mh) in cases {
+        let (cw, ch) = (cw.min(sw), ch.min(sh));
+        let (x, y) = ((sw - cw) / 2, (sh - ch) / 2);
+        let cfg = EncoderConfig {
+            max_width: mw,
+            max_height: mh,
+            fps: 30.0,
+            bitrate_bps: 6_000_000,
+        };
+        let conv = Converter::new(cw, ch, &cfg)?;
+        let mut enc = VideoEncoder::new(cw, ch, cfg)?;
+        let mut dec = VideoDecoder::new()?;
+        let mut pic = conv.new_frame();
+        let mut out_pic = DecodedFrame::empty();
+        let (mut tc, mut tv, mut te, mut td, mut bytes) = (
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            0usize,
+        );
+        for _ in 0..n {
+            let t = Instant::now();
+            let f = fd_capture::crop(cap.capture_ref()?, x, y, cw, ch);
+            tc += t.elapsed();
+            let t = Instant::now();
+            conv.convert(f, &mut pic)?;
+            tv += t.elapsed();
+            let t = Instant::now();
+            let e = enc.encode_i420(&pic, false)?;
+            te += t.elapsed();
+            if let Some(e) = e {
+                bytes += e.data.len();
+                let t = Instant::now();
+                dec.decode_into(&e.data, &mut out_pic)?;
+                td += t.elapsed();
+            }
+        }
+        let (ow, oh) = conv.output_size();
+        let nf = n as f64;
+        let kind = if (ow, oh) == (cw & !1, ch & !1) {
+            "1:1"
+        } else if (ow * 2, oh * 2) == (cw, ch) {
+            "box2"
+        } else {
+            "area"
+        };
+        println!(
+            "{label:<28} {:>9} {kind:>6} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>9.1}",
+            format!("{ow}x{oh}"),
+            ms(tc) / nf,
+            ms(tv) / nf,
+            ms(te) / nf,
+            ms(td) / nf,
+            bytes as f64 / 1024.0 / nf
+        );
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("crops") {
+        let n = std::env::args().nth(2).map_or(Ok(60), |a| a.parse())?;
+        return crops(n);
+    }
     let args: Vec<u32> = std::env::args()
         .skip(1)
         .map(|a| a.parse())

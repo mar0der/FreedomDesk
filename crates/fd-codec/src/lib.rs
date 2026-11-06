@@ -451,6 +451,10 @@ mod tests {
         assert_eq!(fit_size(2560, 1600, 1920, 1080), (1728, 1080));
         assert_eq!(fit_size(5120, 2880, 8000, 8000), (3840, 2160));
         assert_eq!(fit_size(1080, 1920, 1920, 1080), (606, 1080));
+        assert_eq!(fit_size(2560, 1440, 1600, 900), (1600, 900));
+        assert_eq!(fit_size(1280, 720, 1280, 720), (1280, 720));
+        assert_eq!(fit_size(3, 3, 64, 64), (2, 2));
+        assert_eq!(fit_size(3840, 2160, 64, 64), (64, 36));
     }
 
     #[test]
@@ -620,6 +624,42 @@ mod tests {
         check_quadrants(&d);
         // Wrong-size picture is rejected.
         assert!(enc.encode_i420(&I420Frame::new(640, 360), false).is_err());
+    }
+
+    /// Viewer-zoom style crops: arbitrary odd sizes and ratios, small max sizes, 1:1.
+    #[test]
+    fn encode_cropped_regions() {
+        let full = quadrants(1280, 720);
+        // Centred crops keep all four quadrants visible.
+        for (cw, ch, max_w, max_h, want) in [
+            (1001u32, 667u32, 640u32, 640u32, (640u32, 426u32)),
+            (641, 361, 1920, 1080, (640, 360)), // 1:1 (odd -> even crop)
+            (333, 211, 64, 64, (64, 40)),       // small max
+            (99, 99, 1920, 1080, (98, 98)),
+        ] {
+            let (x, y) = ((1280 - cw) / 2, (720 - ch) / 2);
+            let view = fd_capture::crop(full.view(), x, y, cw, ch);
+            assert_eq!((view.width, view.height), (cw, ch));
+            let cfg = EncoderConfig {
+                max_width: max_w,
+                max_height: max_h,
+                ..Default::default()
+            };
+            let mut enc = VideoEncoder::new(cw, ch, cfg).unwrap();
+            assert_eq!(
+                enc.output_size(),
+                want,
+                "crop {cw}x{ch} max {max_w}x{max_h}"
+            );
+            let out = enc.encode(view, false).unwrap().expect("frame");
+            let d = VideoDecoder::new()
+                .unwrap()
+                .decode(&out.data)
+                .unwrap()
+                .unwrap();
+            assert_eq!((d.width, d.height), want);
+            check_quadrants(&d);
+        }
     }
 
     #[test]

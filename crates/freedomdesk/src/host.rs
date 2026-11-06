@@ -3,7 +3,7 @@
 use crate::{consent, load_identity, netpolicy};
 use anyhow::{anyhow, bail, Context, Result};
 use fd_crypto::{normalize_fingerprint, SecureWriter, Session};
-use fd_proto::{HostMsg, ViewerMsg, DEFAULT_PORT, PROTOCOL_VERSION};
+use fd_proto::{HostMsg, Rect, ViewerMsg, DEFAULT_PORT, NORM_MAX, PROTOCOL_VERSION};
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -41,6 +41,10 @@ pub struct HostArgs {
     /// Target video bitrate in kbit/s.
     #[arg(long, default_value_t = 6000)]
     bitrate_kbps: u32,
+    /// Draw the pointer into the video instead of sending it separately
+    /// (legacy behaviour; for latency comparisons).
+    #[arg(long, hide = true)]
+    cursor_in_video: bool,
     /// Exit after the first session ends (useful for tests).
     #[arg(long)]
     once: bool,
@@ -247,10 +251,15 @@ fn deny(w: &mut SecureWriter, reason: &str) -> Result<()> {
     w.send(&fd_proto::encode(&HostMsg::Denied { reason: reason.into() })?)
 }
 
-/// A converted picture plus the native screen size it came from.
+/// A converted picture plus where on the screen it came from.
 struct Pic {
     pic: fd_codec::I420Frame,
+    /// Crop size (encoder source size).
     src: (u32, u32),
+    /// Encoder output bounds the converter was built for.
+    max: (u32, u32),
+    region: Rect,
+    screen: (u32, u32),
 }
 
 /// Single-slot "latest frame wins" hand-off from the capture thread to the encoder.
@@ -260,22 +269,64 @@ struct Slot {
     closed: bool,
 }
 
+/// What the viewer asked to see (normalised region + physical output size).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ViewReq {
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    max_w: u32,
+    max_h: u32,
+}
+
+impl ViewReq {
+    const FULL: ViewReq = ViewReq { x: 0, y: 0, w: NORM_MAX, h: NORM_MAX, max_w: u32::MAX, max_h: u32::MAX };
+}
+
+/// (crop size, output bounds) an encoder was built for.
+type EncKey = ((u32, u32), (u32, u32));
+
 fn pack(w: u32, h: u32) -> u64 {
     ((w as u64) << 32) | h as u64
 }
 
+fn even_down(v: u32) -> u32 {
+    v & !1
+}
+
+/// Screen-pixel crop for a view request: even-aligned, at least 64×64, inside the screen.
+fn crop_rect(r: ViewReq, sw: u32, sh: u32) -> Rect {
+    let scale = |v: u16, full: u32| (v as u64 * full as u64 / NORM_MAX as u64) as u32;
+    let min_w = 64.min(sw);
+    let min_h = 64.min(sh);
+    let w = even_down(scale(r.w, sw).clamp(min_w, sw)).max(2);
+    let h = even_down(scale(r.h, sh).clamp(min_h, sh)).max(2);
+    let x = even_down(scale(r.x, sw).min(sw - w));
+    let y = even_down(scale(r.y, sh).min(sh - h));
+    Rect { x, y, w, h }
+}
+
+/// Encoder output bounds: the host's cap, reduced to what the viewer can show.
+fn out_bounds(args: &HostArgs, r: ViewReq) -> (u32, u32) {
+    let w = even_down(args.max_width.min(r.max_w).max(64));
+    let h = even_down(args.max_height.min(r.max_h).max(64));
+    (w, h)
+}
+
 fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Result<()> {
     let args = &shared.args;
-    let capturer = fd_capture::open_default().context("opening screen capture")?;
+    let mut capturer = fd_capture::open_default().context("opening screen capture")?;
+    // The viewer draws the pointer itself (instant feedback); keep it out of the video.
+    capturer.set_draw_cursor(args.cursor_in_video);
     let (sw, sh) = capturer.size();
-    let cfg = fd_codec::EncoderConfig {
+    let base_cfg = fd_codec::EncoderConfig {
         max_width: args.max_width,
         max_height: args.max_height,
         fps: args.fps.clamp(1.0, 120.0),
         bitrate_bps: args.bitrate_kbps.saturating_mul(1000),
     };
-    let converter = fd_codec::Converter::new(sw, sh, &cfg).context("creating converter")?;
-    let (vw, vh) = converter.output_size();
+    let (vw, vh) = fd_codec::fit_size(sw, sh, args.max_width, args.max_height);
     let injector = if args.view_only {
         None
     } else {
@@ -294,11 +345,11 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         *g = Some(writer.shutdown_handle()?);
     }
     let writer = Arc::new(Mutex::new(writer));
-    let send = |msg: &HostMsg| -> Result<()> {
+    let send_on = |w: &Mutex<SecureWriter>, msg: &HostMsg| -> Result<()> {
         let bytes = fd_proto::encode(msg)?;
-        writer.lock().map_err(|_| anyhow!("writer poisoned"))?.send(&bytes)
+        w.lock().map_err(|_| anyhow!("writer poisoned"))?.send(&bytes)
     };
-    send(&HostMsg::Welcome {
+    send_on(&writer, &HostMsg::Welcome {
         protocol: PROTOCOL_VERSION,
         host_name: shared.host_name.clone(),
         screen_width: sw,
@@ -306,18 +357,21 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         video_width: vw,
         video_height: vh,
     })?;
-    log::info!("session with {viewer_name} started: screen {sw}x{sh} → video {vw}x{vh} @ {} fps", cfg.fps);
+    log::info!("session with {viewer_name} started: screen {sw}x{sh} → video ≤{vw}x{vh} @ {} fps", base_cfg.fps);
 
     let stop = Arc::new(AtomicBool::new(false));
     let want_keyframe = Arc::new(AtomicBool::new(true));
     let force_capture = Arc::new(AtomicBool::new(true));
     let screen_size = Arc::new(std::sync::atomic::AtomicU64::new(pack(sw, sh)));
+    let view_req = Arc::new(Mutex::new(ViewReq::FULL));
 
     // Input / control thread.
     let input_thread = {
         let stop = stop.clone();
         let want_keyframe = want_keyframe.clone();
+        let force_capture = force_capture.clone();
         let screen_size = screen_size.clone();
+        let view_req = view_req.clone();
         let writer = writer.clone();
         let mut injector = injector;
         std::thread::Builder::new().name("host-input".into()).spawn(move || {
@@ -338,6 +392,21 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                                 }
                             }
                         }
+                        ViewerMsg::SetView { x, y, w, h, max_width, max_height } => {
+                            let req = ViewReq {
+                                x,
+                                y,
+                                w: w.max(1),
+                                h: h.max(1),
+                                max_w: max_width.clamp(64, 8192),
+                                max_h: max_height.clamp(64, 8192),
+                            };
+                            let mut g = view_req.lock().map_err(|_| anyhow!("view poisoned"))?;
+                            if *g != req {
+                                *g = req;
+                                force_capture.store(true, Ordering::Relaxed);
+                            }
+                        }
                         ViewerMsg::RequestKeyframe => want_keyframe.store(true, Ordering::Relaxed),
                         ViewerMsg::Ping { ts_us } => {
                             let b = fd_proto::encode(&HostMsg::Pong { ts_us })?;
@@ -356,7 +425,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         })?
     };
 
-    // Capture + convert thread → slot → encode + send (this thread).
+    // Capture + crop + convert (+ cursor) thread → slot → encode + send (this thread).
     let slot = Arc::new((Mutex::new(Slot::default()), std::sync::Condvar::new()));
     let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<fd_codec::I420Frame>();
     let capture_thread = {
@@ -364,29 +433,70 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         let slot = slot.clone();
         let force_capture = force_capture.clone();
         let screen_size = screen_size.clone();
-        let cfg = cfg.clone();
-        let mut capturer = capturer;
-        let mut converter = converter;
-        let interval = Duration::from_secs_f32(1.0 / cfg.fps);
+        let view_req = view_req.clone();
+        let writer = writer.clone();
+        let base_cfg = base_cfg.clone();
+        let args = args.clone();
+        let interval = Duration::from_secs_f32(1.0 / base_cfg.fps);
         std::thread::Builder::new().name("host-capture".into()).spawn(move || {
             let result = (|| -> Result<()> {
+                let (mut sw, mut sh) = capturer.size();
+                // (crop size, output bounds) the converter was built for.
+                let mut conv_key = ((0u32, 0u32), (0u32, 0u32));
+                let mut converter: Option<fd_codec::Converter> = None;
+                let mut last_cursor: Option<(i32, i32, bool)> = None;
                 while !stop.load(Ordering::SeqCst) {
                     let tick = Instant::now();
+
+                    // Cursor channel: shape on change, position on change.
+                    if !args.cursor_in_video {
+                        if let Some(ci) = capturer.cursor()? {
+                            if let Some(shape) = ci.shape {
+                                send_on(&writer, &HostMsg::CursorShape {
+                                    serial: ci.serial,
+                                    width: shape.width,
+                                    height: shape.height,
+                                    xhot: shape.xhot,
+                                    yhot: shape.yhot,
+                                    rgba: shape.rgba,
+                                })?;
+                            }
+                            let pos = (ci.x, ci.y, ci.visible);
+                            if last_cursor != Some(pos) {
+                                last_cursor = Some(pos);
+                                send_on(&writer, &HostMsg::CursorPos { x: ci.x, y: ci.y, visible: ci.visible })?;
+                            }
+                        }
+                    }
+
+                    let req = *view_req.lock().map_err(|_| anyhow!("view poisoned"))?;
+                    let crop = crop_rect(req, sw, sh);
+                    let max = out_bounds(&args, req);
+                    let key = ((crop.w, crop.h), max);
+                    if converter.is_none() || conv_key != key {
+                        let cfg = fd_codec::EncoderConfig { max_width: max.0, max_height: max.1, ..base_cfg.clone() };
+                        converter = Some(fd_codec::Converter::new(crop.w, crop.h, &cfg)?);
+                        conv_key = key;
+                        force_capture.store(true, Ordering::Relaxed);
+                    }
+                    let conv = converter.as_ref().expect("converter just set");
+
                     let grabbed = if force_capture.swap(false, Ordering::Relaxed) {
                         capturer.capture_ref().map(Some)
                     } else {
                         capturer.capture_if_changed()
                     };
                     match grabbed {
-                        Ok(Some(view)) => {
+                        Ok(Some(frame)) => {
+                            let sub = fd_capture::crop(frame, crop.x, crop.y, crop.w, crop.h);
                             let mut pic = recycle_rx
                                 .try_iter()
-                                .find(|p| (p.width(), p.height()) == converter.output_size())
-                                .unwrap_or_else(|| converter.new_frame());
-                            converter.convert(view, &mut pic)?;
+                                .find(|p| (p.width(), p.height()) == conv.output_size())
+                                .unwrap_or_else(|| conv.new_frame());
+                            conv.convert(sub, &mut pic)?;
                             let (lock, cv) = &*slot;
                             let mut g = lock.lock().map_err(|_| anyhow!("slot poisoned"))?;
-                            g.pic = Some(Pic { pic, src: converter.source_size() });
+                            g.pic = Some(Pic { pic, src: (crop.w, crop.h), max, region: crop, screen: (sw, sh) });
                             cv.notify_one();
                         }
                         Ok(None) => {}
@@ -404,11 +514,12 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                                     Err(e) => return Err(e.context("reopening capture after resize")),
                                 }
                             };
-                            let (w, h) = capturer.size();
-                            converter = fd_codec::Converter::new(w, h, &cfg)?;
-                            screen_size.store(pack(w, h), Ordering::Relaxed);
+                            capturer.set_draw_cursor(args.cursor_in_video);
+                            (sw, sh) = capturer.size();
+                            screen_size.store(pack(sw, sh), Ordering::Relaxed);
+                            converter = None;
                             force_capture.store(true, Ordering::Relaxed);
-                            log::info!("screen resized to {w}x{h}; video now {:?}", converter.output_size());
+                            log::info!("screen resized to {sw}x{sh}");
                             continue;
                         }
                         Err(e) => return Err(e),
@@ -431,7 +542,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
 
     let t0 = Instant::now();
     let mut seq = 0u64;
-    let mut encoder: Option<(fd_codec::VideoEncoder, (u32, u32))> = None;
+    let mut encoder: Option<(fd_codec::VideoEncoder, EncKey)> = None;
     let mut last: Option<Pic> = None;
     let mut kf_retries = 0u32;
     let video_result = (|| -> Result<()> {
@@ -464,18 +575,23 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                 force_capture.store(true, Ordering::Relaxed);
                 continue;
             };
-            if encoder.as_ref().is_none_or(|(_, src)| *src != pic.src) {
-                encoder = Some((fd_codec::VideoEncoder::new(pic.src.0, pic.src.1, cfg.clone())?, pic.src));
+            let key = (pic.src, pic.max);
+            if encoder.as_ref().is_none_or(|(_, k)| *k != key) {
+                let cfg = fd_codec::EncoderConfig { max_width: pic.max.0, max_height: pic.max.1, ..base_cfg.clone() };
+                encoder = Some((fd_codec::VideoEncoder::new(pic.src.0, pic.src.1, cfg)?, key));
             }
             let (enc, _) = encoder.as_mut().expect("encoder just set");
             match enc.encode_i420(&pic.pic, kf)? {
                 Some(out) => {
                     kf_retries = 0;
                     seq += 1;
-                    send(&HostMsg::Video {
+                    send_on(&writer, &HostMsg::Video {
                         seq,
                         keyframe: out.keyframe,
                         ts_us: t0.elapsed().as_micros() as u64,
+                        region: pic.region,
+                        screen_width: pic.screen.0,
+                        screen_height: pic.screen.1,
                         data: out.data,
                     })?;
                 }
@@ -492,7 +608,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
     let capture_result = capture_thread.join().map_err(|_| anyhow!("capture thread panicked"))?;
     let video_result = video_result.and(capture_result);
     if video_result.is_ok() {
-        let _ = send(&HostMsg::Bye { reason: "host ended session".into() });
+        let _ = send_on(&writer, &HostMsg::Bye { reason: "host ended session".into() });
     }
     shutdown.shutdown();
     if let Ok(mut g) = shared.active_socket.lock() {
@@ -506,6 +622,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         _ => Ok(()),
     }
 }
+
 
 fn is_disconnect(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
@@ -567,4 +684,22 @@ pub fn hostname() -> String {
         .or_else(|| std::env::var("HOSTNAME").ok())
         .map(|s| crate::consent::sanitize(&s, 64))
         .unwrap_or_else(|| "freedomdesk-host".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crop_is_even_inside_and_min_sized() {
+        let full = crop_rect(ViewReq::FULL, 3840, 2160);
+        assert_eq!(full, Rect { x: 0, y: 0, w: 3840, h: 2160 });
+        let r = ViewReq { x: 65535, y: 65535, w: 10, h: 10, max_w: 100, max_h: 100 };
+        let c = crop_rect(r, 3840, 2160);
+        assert!(c.w >= 64 && c.h >= 64 && c.x + c.w <= 3840 && c.y + c.h <= 2160);
+        assert!([c.x, c.y, c.w, c.h].iter().all(|v| v.is_multiple_of(2)));
+        let half = ViewReq { x: 16384, y: 16384, w: 32768, h: 32768, max_w: 1, max_h: 1 };
+        let c = crop_rect(half, 3841, 2161);
+        assert!(c.x + c.w <= 3841 && c.y + c.h <= 2161);
+    }
 }

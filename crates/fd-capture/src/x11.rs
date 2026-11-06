@@ -11,7 +11,7 @@ use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::NONE;
 
-use crate::{Capturer, Frame, FrameRef, ScreenResized};
+use crate::{Capturer, CursorInfo, CursorShape, Frame, FrameRef, ScreenResized, MAX_CURSOR_SHAPE};
 
 const ALL_PLANES: u32 = !0;
 /// Largest cursor image we accept from the server (defensive; real cursors are <= 256x256).
@@ -98,7 +98,52 @@ struct CursorImage {
     height: usize,
     xhot: i32,
     yhot: i32,
+    serial: u32,
+    /// Every pixel fully transparent (apps "hide" the cursor this way).
+    blank: bool,
     pixels: Vec<u32>,
+}
+
+impl CursorImage {
+    /// Straight-alpha RGBA, cropped around the hotspot to at most MAX_CURSOR_SHAPE square.
+    fn to_shape(&self) -> CursorShape {
+        let max = MAX_CURSOR_SHAPE as usize;
+        let (cw, ch) = (self.width.min(max), self.height.min(max));
+        let x0 = (self.xhot.max(0) as usize)
+            .saturating_sub(cw / 2)
+            .min(self.width - cw);
+        let y0 = (self.yhot.max(0) as usize)
+            .saturating_sub(ch / 2)
+            .min(self.height - ch);
+        let mut rgba = Vec::with_capacity(cw * ch * 4);
+        for y in y0..y0 + ch {
+            for &p in &self.pixels[y * self.width + x0..][..cw] {
+                rgba.extend_from_slice(&unpremultiply(p));
+            }
+        }
+        CursorShape {
+            width: cw as u32,
+            height: ch as u32,
+            xhot: (self.xhot - x0 as i32).clamp(0, cw as i32 - 1) as u32,
+            yhot: (self.yhot - y0 as i32).clamp(0, ch as i32 - 1) as u32,
+            rgba,
+        }
+    }
+}
+
+/// Premultiplied 0xAARRGGBB -> straight [R, G, B, A].
+fn unpremultiply(p: u32) -> [u8; 4] {
+    let a = p >> 24;
+    if a == 0 {
+        return [0; 4];
+    }
+    let un = |c: u32| ((c * 255 + a / 2) / a).min(255) as u8;
+    [
+        un((p >> 16) & 0xff),
+        un((p >> 8) & 0xff),
+        un(p & 0xff),
+        a as u8,
+    ]
 }
 
 struct CursorState {
@@ -107,6 +152,8 @@ struct CursorState {
     stale: bool,
     /// Pointer position used for the last captured frame.
     last_pos: Option<(i32, i32)>,
+    /// Serial of the shape last returned by `cursor()`.
+    reported_serial: Option<u32>,
 }
 
 pub struct X11Capturer {
@@ -188,6 +235,7 @@ impl X11Capturer {
                 image: None,
                 stale: true,
                 last_pos: None,
+                reported_serial: None,
             }),
             Err(e) => {
                 log::warn!(
@@ -300,6 +348,27 @@ impl X11Capturer {
         })
     }
 
+    /// Cache a fetched cursor image (clears the stale flag).
+    fn store_shape(cursor: &mut Option<CursorState>, img: xfixes::GetCursorImageReply) {
+        let Some(c) = cursor.as_mut() else { return };
+        c.stale = false;
+        let n = usize::from(img.width) * usize::from(img.height);
+        c.image = (img.width > 0
+            && img.height > 0
+            && img.width <= MAX_CURSOR_DIM
+            && img.height <= MAX_CURSOR_DIM
+            && img.cursor_image.len() >= n)
+            .then(|| CursorImage {
+                width: usize::from(img.width),
+                height: usize::from(img.height),
+                xhot: i32::from(img.xhot),
+                yhot: i32::from(img.yhot),
+                serial: img.cursor_serial,
+                blank: img.cursor_image[..n].iter().all(|&p| p >> 24 == 0),
+                pixels: img.cursor_image,
+            });
+    }
+
     /// Drain pending X events into the dirty / cursor-stale flags.
     fn process_events(&mut self) -> anyhow::Result<()> {
         while let Some(ev) = self.conn.poll_for_event()? {
@@ -404,21 +473,7 @@ impl X11Capturer {
         if let Some(cookie) = shape_cookie {
             let img = cookie.reply().context("XFixesGetCursorImage failed")?;
             pos = Some((i32::from(img.x), i32::from(img.y)));
-            let c = self.cursor.as_mut().expect("cursor state");
-            c.stale = false;
-            let n = usize::from(img.width) * usize::from(img.height);
-            c.image = (img.width > 0
-                && img.height > 0
-                && img.width <= MAX_CURSOR_DIM
-                && img.height <= MAX_CURSOR_DIM
-                && img.cursor_image.len() >= n)
-                .then(|| CursorImage {
-                    width: usize::from(img.width),
-                    height: usize::from(img.height),
-                    xhot: i32::from(img.xhot),
-                    yhot: i32::from(img.yhot),
-                    pixels: img.cursor_image,
-                });
+            Self::store_shape(&mut self.cursor, img);
         }
         if want_cursor {
             let c = self.cursor.as_mut().expect("cursor state");
@@ -505,6 +560,43 @@ impl Capturer for X11Capturer {
     fn capture_ref(&mut self) -> anyhow::Result<FrameRef<'_>> {
         self.capture_inner(false, false)?;
         Ok(self.grabbed())
+    }
+
+    fn cursor(&mut self) -> anyhow::Result<Option<CursorInfo>> {
+        let Some(stale) = self.cursor.as_ref().map(|c| c.stale) else {
+            return Ok(None);
+        };
+        self.process_events()?;
+        let stale = stale || self.cursor.as_ref().is_some_and(|c| c.stale);
+        let (x, y, on_screen) = if stale {
+            let img = self
+                .conn
+                .xfixes_get_cursor_image()?
+                .reply()
+                .context("XFixesGetCursorImage failed")?;
+            let pos = (i32::from(img.x), i32::from(img.y), true);
+            Self::store_shape(&mut self.cursor, img);
+            pos
+        } else {
+            let p = self.conn.query_pointer(self.root)?.reply()?;
+            (i32::from(p.root_x), i32::from(p.root_y), p.same_screen)
+        };
+        let c = self.cursor.as_mut().expect("cursor state");
+        let serial = c.image.as_ref().map_or(0, |i| i.serial);
+        let shape = if c.reported_serial != Some(serial) {
+            c.reported_serial = Some(serial);
+            c.image.as_ref().map(CursorImage::to_shape)
+        } else {
+            None
+        };
+        let visible = on_screen && c.image.as_ref().is_some_and(|i| !i.blank);
+        Ok(Some(CursorInfo {
+            x,
+            y,
+            visible,
+            serial,
+            shape,
+        }))
     }
 
     fn set_draw_cursor(&mut self, on: bool) {
@@ -640,6 +732,99 @@ mod tests {
         assert!(changed, "DAMAGE did not report the mapped window");
     }
 
+    /// Warps the pointer, so it only runs against a throwaway server named by FD_TEST_DISPLAY
+    /// (e.g. `Xephyr :5 -screen 320x240`):
+    /// `FD_TEST_DISPLAY=:5 cargo test -p fd-capture -- --ignored cursor_motion`.
+    #[test]
+    #[ignore]
+    fn cursor_motion_counts_only_when_drawn() {
+        let Some(display) = std::env::var("FD_TEST_DISPLAY").ok() else {
+            eprintln!("FD_TEST_DISPLAY not set; skipping");
+            return;
+        };
+        let mut cap = X11Capturer::open(Some(&display)).unwrap();
+        let (w, h) = cap.size();
+        let root = cap.root;
+        let warp = |cap: &X11Capturer, x: i16, y: i16| {
+            cap.conn
+                .warp_pointer(NONE, root, 0, 0, 0, 0, x, y)
+                .unwrap()
+                .check()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let settle = |cap: &mut X11Capturer| {
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if cap.capture_if_changed().unwrap().is_none() {
+                    return;
+                }
+            }
+            panic!("screen never settled");
+        };
+        // Not drawn: motion must not count; cursor() still tracks it.
+        cap.set_draw_cursor(false);
+        warp(&cap, 10, 10);
+        cap.capture().unwrap();
+        settle(&mut cap);
+        warp(&cap, (w / 2) as i16, (h / 2) as i16);
+        assert!(
+            cap.capture_if_changed().unwrap().is_none(),
+            "pure cursor motion reported as a change with draw_cursor(false)"
+        );
+        let ci = cap.cursor().unwrap().expect("XFixes");
+        assert_eq!((ci.x, ci.y), ((w / 2) as i32, (h / 2) as i32));
+        // Drawn: motion counts.
+        cap.set_draw_cursor(true);
+        cap.capture().unwrap();
+        settle(&mut cap);
+        warp(&cap, 20, 20);
+        assert!(cap.capture_if_changed().unwrap().is_some());
+    }
+
+    #[test]
+    fn cursor_info_reports_shape_once() {
+        let Some(mut cap) = open_or_skip() else {
+            return;
+        };
+        cap.set_draw_cursor(false);
+        let first = cap.cursor().unwrap().expect("XFixes available");
+        let shape = first.shape.expect("shape on first call");
+        assert!(shape.width >= 1 && shape.width <= MAX_CURSOR_SHAPE);
+        assert!(shape.height >= 1 && shape.height <= MAX_CURSOR_SHAPE);
+        assert_eq!(shape.rgba.len(), (shape.width * shape.height * 4) as usize);
+        assert!(shape.xhot < shape.width && shape.yhot < shape.height);
+        let (w, h) = cap.size();
+        assert!((0..w as i32).contains(&first.x) && (0..h as i32).contains(&first.y));
+        let second = cap.cursor().unwrap().unwrap();
+        if second.serial == first.serial {
+            assert!(
+                second.shape.is_none(),
+                "shape must only be sent when the serial changes"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_shape_crop_and_unpremultiply() {
+        assert_eq!(unpremultiply(0x8040_2010), [0x80, 0x40, 0x20, 0x80]);
+        assert_eq!(unpremultiply(0x0000_0000), [0, 0, 0, 0]);
+        assert_eq!(unpremultiply(0xffff_ffff), [255, 255, 255, 255]);
+        let img = CursorImage {
+            width: 300,
+            height: 20,
+            xhot: 290,
+            yhot: 5,
+            serial: 7,
+            blank: false,
+            pixels: vec![0xff00_ff00; 300 * 20],
+        };
+        let s = img.to_shape();
+        assert_eq!((s.width, s.height), (256, 20));
+        assert_eq!((s.xhot, s.yhot), (290 - 44, 5));
+        assert_eq!(&s.rgba[..4], &[0, 255, 0, 255]);
+    }
+
     #[test]
     fn cursor_blend_clips_and_blends() {
         let mut f = vec![100u8; 32];
@@ -649,6 +834,8 @@ mod tests {
             height: 2,
             xhot: 0,
             yhot: 0,
+            serial: 1,
+            blank: false,
             pixels: vec![0xffff_0000, 0x0000_0000, 0x8080_8080, 0xff00_00ff],
         };
         composite_cursor(&mut f, 4, 2, 16, &img, 3, 0); // only the left column is visible (x=3)

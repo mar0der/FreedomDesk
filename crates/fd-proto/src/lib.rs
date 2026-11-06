@@ -6,7 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// v2: Video carries its screen region; cursor is a separate channel; viewer sets its view.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Default TCP port for the host agent.
 pub const DEFAULT_PORT: u16 = 47801;
@@ -21,6 +22,15 @@ pub enum MouseButton {
     Right,
     Back,
     Forward,
+}
+
+/// Rectangle in host screen pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
 }
 
 /// Input event sent viewer → host.
@@ -56,14 +66,23 @@ pub enum HostMsg {
     },
     /// Host user (or policy) refused the session.
     Denied { reason: String },
-    /// One encoded H.264 access unit (Annex-B).
+    /// One encoded H.264 access unit (Annex-B) showing `region` of a
+    /// `screen_width`×`screen_height` screen (the viewer's zoom crop).
     Video {
         seq: u64,
         keyframe: bool,
         /// Host monotonic capture timestamp, microseconds since session start.
         ts_us: u64,
+        region: Rect,
+        screen_width: u32,
+        screen_height: u32,
         data: Vec<u8>,
     },
+    /// New pointer image (straight RGBA8, ≤ 256×256). The viewer draws the
+    /// cursor itself, so pointer motion never waits for video.
+    CursorShape { serial: u32, width: u32, height: u32, xhot: u32, yhot: u32, rgba: Vec<u8> },
+    /// Host pointer position in screen pixels.
+    CursorPos { x: i32, y: i32, visible: bool },
     Pong { ts_us: u64 },
     Bye { reason: String },
 }
@@ -74,6 +93,9 @@ pub enum ViewerMsg {
     Hello { protocol: u16, viewer_name: String },
     Input(InputEvent),
     RequestKeyframe,
+    /// The part of the screen the viewer shows (normalised 0..=NORM_MAX) and
+    /// the physical pixel size it is shown at. The host crops and scales to it.
+    SetView { x: u16, y: u16, w: u16, h: u16, max_width: u32, max_height: u32 },
     Ping { ts_us: u64 },
     Bye,
 }
@@ -95,7 +117,15 @@ mod tests {
         let m = ViewerMsg::Input(InputEvent::Text { ch: 'Ж' });
         let b = encode(&m).unwrap();
         assert_eq!(decode::<ViewerMsg>(&b).unwrap(), m);
-        let h = HostMsg::Video { seq: 7, keyframe: true, ts_us: 42, data: vec![0, 0, 0, 1, 0x67] };
+        let h = HostMsg::Video {
+            seq: 7,
+            keyframe: true,
+            ts_us: 42,
+            region: Rect { x: 1, y: 2, w: 3, h: 4 },
+            screen_width: 3840,
+            screen_height: 2160,
+            data: vec![0, 0, 0, 1, 0x67],
+        };
         let b = encode(&h).unwrap();
         assert_eq!(decode::<HostMsg>(&b).unwrap(), h);
     }
