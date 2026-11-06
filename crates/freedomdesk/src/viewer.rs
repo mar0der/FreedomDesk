@@ -442,6 +442,17 @@ fn spawn_reader(mut reader: SecureReader, latest: Arc<Mutex<Latest>>, tx: Sender
                 match msg {
                     HostMsg::Video { data, keyframe, region, screen_width, screen_height, .. } => {
                         let n = data.len() as u64;
+                        let fits = |o: u32, l: u32, full: u32| o.checked_add(l).is_some_and(|e| e <= full) && l > 0;
+                        if screen_width == 0
+                            || screen_height == 0
+                            || screen_width > 16384
+                            || screen_height > 16384
+                            || !fits(region.x, region.w, screen_width)
+                            || !fits(region.y, region.h, screen_height)
+                        {
+                            log::warn!("ignoring video with invalid region {region:?} of {screen_width}x{screen_height}");
+                            continue;
+                        }
                         if let Some(f) = dec.decode(&data, keyframe, &tx) {
                             let mut l = latest.lock().unwrap();
                             l.frame = Some((f, region, (screen_width, screen_height)));
@@ -495,8 +506,9 @@ impl From<egui::Modifiers> for Mods {
 }
 
 /// Viewer-only shortcuts are Ctrl+Alt (Control+Option on a Mac) + key/scroll; never forwarded.
+/// Windows reports AltGr as Ctrl+Alt, so there the chord is Ctrl+Alt+Shift (AltGr typing must work).
 fn is_view_hotkey(m: egui::Modifiers) -> bool {
-    m.ctrl && m.alt && !m.mac_cmd
+    m.ctrl && m.alt && !m.mac_cmd && (!cfg!(windows) || m.shift)
 }
 
 /// Maps between the window (egui points) and the remote screen (pixels).
@@ -777,10 +789,11 @@ impl ViewerApp {
             Num1 => self.zoom_100(ppp),
             Plus | Equals => self.zoom_at(1.25, c),
             Minus => self.zoom_at(0.8, c),
-            ArrowLeft => self.center.x -= step.x,
-            ArrowRight => self.center.x += step.x,
-            ArrowUp => self.center.y -= step.y,
-            ArrowDown => self.center.y += step.y,
+            // Arrows pan only while zoomed; otherwise Ctrl+Alt+arrows go to the host (workspaces).
+            ArrowLeft if self.zoom > 1.0001 => self.center.x -= step.x,
+            ArrowRight if self.zoom > 1.0001 => self.center.x += step.x,
+            ArrowUp if self.zoom > 1.0001 => self.center.y -= step.y,
+            ArrowDown if self.zoom > 1.0001 => self.center.y += step.y,
             _ => return false,
         }
         self.layout(self.xf.rect);
@@ -816,7 +829,11 @@ impl ViewerApp {
             return false;
         }
         let depth = |d: f32| ((EDGE_PAN_ZONE - d) / EDGE_PAN_ZONE).clamp(0.0, 1.0);
-        let dir = egui::vec2(depth(r.right() - p.x) - depth(p.x - r.left()), depth(r.bottom() - p.y) - depth(p.y - r.top()));
+        let mut dir = egui::vec2(depth(r.right() - p.x) - depth(p.x - r.left()), depth(r.bottom() - p.y) - depth(p.y - r.top()));
+        // Reaching for the toolbar must not scroll the view up.
+        if dir.y < 0.0 && self.toolbar_rect.is_positive() && self.toolbar_rect.x_range().contains(p.x) {
+            dir.y = 0.0;
+        }
         if dir == egui::Vec2::ZERO {
             return false;
         }
@@ -862,7 +879,7 @@ impl ViewerApp {
         if let Some(t) = &self.texture {
             let r = self.tex_region;
             let a = self.xf.to_view(egui::pos2(r.x as f32, r.y as f32));
-            let b = self.xf.to_view(egui::pos2((r.x + r.w) as f32, (r.y + r.h) as f32));
+            let b = self.xf.to_view(egui::pos2(r.x as f32 + r.w as f32, r.y as f32 + r.h as f32));
             painter.image(t.id(), egui::Rect::from_min_max(a, b), egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
         } else {
             painter.text(self.xf.rect.center(), egui::Align2::CENTER_CENTER, "Waiting for video …", egui::FontId::proportional(20.0), egui::Color32::GRAY);
@@ -954,10 +971,18 @@ impl eframe::App for ViewerApp {
         let (total, rtt) = self.sync_textures(ctx);
         let rect = ctx.available_rect();
         self.layout(rect);
+        let view_before = (self.xf.scale, self.xf.center);
         if self.ended.is_none() {
             self.handle_input(ctx);
         }
         let panning = self.edge_pan(ctx);
+        // If zoom/pan moved the picture under a still mouse, move the host pointer too.
+        if (self.xf.scale, self.xf.center) != view_before && self.ended.is_none() {
+            if let Some(n) = ctx.input(|i| i.pointer.latest_pos()).and_then(|p| self.norm(p)) {
+                self.pending_move = Some(n);
+                self.flush_move();
+            }
+        }
         self.update_view_request(ppp);
 
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::BLACK)).show(ctx, |ui| {

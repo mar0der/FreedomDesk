@@ -302,8 +302,8 @@ fn crop_rect(r: ViewReq, sw: u32, sh: u32) -> Rect {
     let min_h = 64.min(sh);
     let w = even_down(scale(r.w, sw).clamp(min_w, sw)).max(2);
     let h = even_down(scale(r.h, sh).clamp(min_h, sh)).max(2);
-    let x = even_down(scale(r.x, sw).min(sw - w));
-    let y = even_down(scale(r.y, sh).min(sh - h));
+    let x = even_down(scale(r.x, sw).min(sw.saturating_sub(w)));
+    let y = even_down(scale(r.y, sh).min(sh.saturating_sub(h)));
     Rect { x, y, w, h }
 }
 
@@ -445,12 +445,22 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                 let mut conv_key = ((0u32, 0u32), (0u32, 0u32));
                 let mut converter: Option<fd_codec::Converter> = None;
                 let mut last_cursor: Option<(i32, i32, bool)> = None;
+                let mut req = ViewReq::FULL;
+                let mut last_adopt = Instant::now() - Duration::from_secs(1);
                 while !stop.load(Ordering::SeqCst) {
                     let tick = Instant::now();
 
                     // Cursor channel: shape on change, position on change.
-                    if !args.cursor_in_video {
-                        if let Some(ci) = capturer.cursor()? {
+                    let cursor = if args.cursor_in_video {
+                        None
+                    } else {
+                        capturer.cursor().unwrap_or_else(|e| {
+                            log::debug!("cursor: {e:#}");
+                            None
+                        })
+                    };
+                    {
+                        if let Some(ci) = cursor {
                             if let Some(shape) = ci.shape {
                                 send_on(&writer, &HostMsg::CursorShape {
                                     serial: ci.serial,
@@ -469,7 +479,13 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                         }
                     }
 
-                    let req = *view_req.lock().map_err(|_| anyhow!("view poisoned"))?;
+                    // Adopt view changes at most 5×/s: each new size rebuilds converter+encoder (IDR).
+                    let wanted = *view_req.lock().map_err(|_| anyhow!("view poisoned"))?;
+                    if wanted != req && last_adopt.elapsed() >= Duration::from_millis(200) {
+                        req = wanted;
+                        last_adopt = Instant::now();
+                        force_capture.store(true, Ordering::Relaxed); // new region: grab even if static
+                    }
                     let crop = crop_rect(req, sw, sh);
                     let max = out_bounds(&args, req);
                     let key = ((crop.w, crop.h), max);
