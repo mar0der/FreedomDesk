@@ -1,14 +1,21 @@
-//! X11 root-window capture: MIT-SHM fast path with plain `GetImage` fallback.
+//! X11 root-window capture: MIT-SHM fast path with plain `GetImage` fallback, XFixes cursor
+//! compositing and DAMAGE-based change detection.
 
 use anyhow::{anyhow, bail, Context};
 use x11rb::connection::{Connection, RequestConnection};
+use x11rb::protocol::damage::{self, ConnectionExt as _, ReportLevel};
 use x11rb::protocol::shm::{self, ConnectionExt as _};
+use x11rb::protocol::xfixes::{self, ConnectionExt as _, CursorNotifyMask};
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, ImageOrder, VisualClass, Window};
+use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
+use x11rb::NONE;
 
-use crate::{Capturer, Frame, ScreenResized};
+use crate::{Capturer, Frame, FrameRef, ScreenResized};
 
 const ALL_PLANES: u32 = !0;
+/// Largest cursor image we accept from the server (defensive; real cursors are <= 256x256).
+const MAX_CURSOR_DIM: u16 = 512;
 
 /// A System V shared memory segment attached both locally and to the X server.
 struct ShmSegment {
@@ -55,13 +62,23 @@ impl ShmSegment {
                 libc::shmdt(addr);
                 return Err(e.context("XShmAttach failed (remote X server?)"));
             }
-            Ok(Self { seg, addr: addr.cast(), size })
+            Ok(Self {
+                seg,
+                addr: addr.cast(),
+                size,
+            })
         }
     }
 
+    // SAFETY (both): addr..addr+size is our live private mapping. The X server writes into it
+    // only while processing our ShmGetImage, and we only hand out slices after that request's
+    // reply and before issuing the next one (enforced by the &self/&mut self borrows).
     fn bytes(&self) -> &[u8] {
-        // SAFETY: addr..addr+size is our live mapping.
         unsafe { std::slice::from_raw_parts(self.addr, self.size) }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.addr, self.size) }
     }
 
     fn release(&mut self, conn: &RustConnection) {
@@ -75,6 +92,23 @@ impl ShmSegment {
     }
 }
 
+/// Cached cursor image, premultiplied ARGB (0xAARRGGBB) as delivered by XFixes.
+struct CursorImage {
+    width: usize,
+    height: usize,
+    xhot: i32,
+    yhot: i32,
+    pixels: Vec<u32>,
+}
+
+struct CursorState {
+    image: Option<CursorImage>,
+    /// Shape changed (XFixes CursorNotify) since we last fetched the image.
+    stale: bool,
+    /// Pointer position used for the last captured frame.
+    last_pos: Option<(i32, i32)>,
+}
+
 pub struct X11Capturer {
     conn: RustConnection,
     root: Window,
@@ -82,12 +116,20 @@ pub struct X11Capturer {
     height: u32,
     shm: Option<ShmSegment>,
     frame: Frame,
+    /// DAMAGE object on the root window; `None` if the extension is unavailable.
+    damage: Option<damage::Damage>,
+    /// Something changed since the last capture (or we can't tell).
+    dirty: bool,
+    /// XFixes cursor support; `None` if unavailable.
+    cursor: Option<CursorState>,
+    draw_cursor: bool,
 }
 
 impl X11Capturer {
     /// Connect to `display` (or `$DISPLAY` if `None`) and prepare to capture its default root window.
     pub fn open(display: Option<&str>) -> anyhow::Result<Self> {
-        let (conn, screen_num) = x11rb::connect(display).context("fd-capture: cannot connect to X display")?;
+        let (conn, screen_num) =
+            x11rb::connect(display).context("fd-capture: cannot connect to X display")?;
         let setup = conn.setup();
         let screen = setup
             .roots
@@ -137,8 +179,30 @@ impl X11Capturer {
         let shm = Self::try_shm(&conn, stride * height as usize);
         match &shm {
             Ok(_) => log::info!("fd-capture: X11 {width}x{height} via MIT-SHM"),
-            Err(e) => log::warn!("fd-capture: MIT-SHM unavailable ({e:#}); falling back to slow GetImage"),
+            Err(e) => {
+                log::warn!("fd-capture: MIT-SHM unavailable ({e:#}); falling back to slow GetImage")
+            }
         }
+        let cursor = match Self::try_xfixes(&conn, root) {
+            Ok(()) => Some(CursorState {
+                image: None,
+                stale: true,
+                last_pos: None,
+            }),
+            Err(e) => {
+                log::warn!(
+                    "fd-capture: XFixes unavailable ({e:#}); the mouse cursor will not be drawn"
+                );
+                None
+            }
+        };
+        let damage = match Self::try_damage(&conn, root) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                log::warn!("fd-capture: DAMAGE unavailable ({e:#}); every frame counts as changed");
+                None
+            }
+        };
 
         Ok(Self {
             conn,
@@ -146,7 +210,16 @@ impl X11Capturer {
             width,
             height,
             shm: shm.ok(),
-            frame: Frame { width, height, stride, data: vec![0; stride * height as usize] },
+            frame: Frame {
+                width,
+                height,
+                stride,
+                data: vec![0; stride * height as usize],
+            },
+            damage,
+            dirty: true,
+            cursor,
+            draw_cursor: true,
         })
     }
 
@@ -154,11 +227,46 @@ impl X11Capturer {
         if std::env::var_os("FD_CAPTURE_NO_SHM").is_some() {
             bail!("disabled by FD_CAPTURE_NO_SHM");
         }
-        if conn.extension_information(shm::X11_EXTENSION_NAME)?.is_none() {
+        if conn
+            .extension_information(shm::X11_EXTENSION_NAME)?
+            .is_none()
+        {
             bail!("MIT-SHM extension not present");
         }
         conn.shm_query_version()?.reply()?;
         ShmSegment::create(conn, size)
+    }
+
+    fn try_xfixes(conn: &RustConnection, root: Window) -> anyhow::Result<()> {
+        if conn
+            .extension_information(xfixes::X11_EXTENSION_NAME)?
+            .is_none()
+        {
+            bail!("XFIXES extension not present");
+        }
+        let v = conn.xfixes_query_version(4, 0)?.reply()?;
+        if v.major_version < 2 {
+            bail!("XFIXES {}.{} too old", v.major_version, v.minor_version);
+        }
+        conn.xfixes_select_cursor_input(root, CursorNotifyMask::DISPLAY_CURSOR)?
+            .check()?;
+        Ok(())
+    }
+
+    fn try_damage(conn: &RustConnection, root: Window) -> anyhow::Result<damage::Damage> {
+        if conn
+            .extension_information(damage::X11_EXTENSION_NAME)?
+            .is_none()
+        {
+            bail!("DAMAGE extension not present");
+        }
+        conn.damage_query_version(1, 1)?.reply()?;
+        let id = conn.generate_id()?;
+        // NON_EMPTY: one notify when the damage region goes from empty to non-empty; we reset it
+        // with Subtract before every capture.
+        conn.damage_create(id, root, ReportLevel::NON_EMPTY)?
+            .check()?;
+        Ok(id)
     }
 
     /// Whether the fast MIT-SHM path is in use.
@@ -166,8 +274,214 @@ impl X11Capturer {
         self.shm.is_some()
     }
 
+    /// Whether DAMAGE-based change detection is available.
+    pub fn has_damage(&self) -> bool {
+        self.damage.is_some()
+    }
+
+    /// The most recent grab, wherever it lives (SHM segment or `self.frame`).
+    fn grabbed(&self) -> FrameRef<'_> {
+        let data = match &self.shm {
+            Some(shm) => &shm.bytes()[..self.frame.data.len()],
+            None => &self.frame.data[..],
+        };
+        FrameRef {
+            width: self.width,
+            height: self.height,
+            stride: self.frame.stride,
+            data,
+        }
+    }
+
     fn resized_error(&self, new: (u32, u32)) -> anyhow::Error {
-        anyhow::Error::new(ScreenResized { old: (self.width, self.height), new })
+        anyhow::Error::new(ScreenResized {
+            old: (self.width, self.height),
+            new,
+        })
+    }
+
+    /// Drain pending X events into the dirty / cursor-stale flags.
+    fn process_events(&mut self) -> anyhow::Result<()> {
+        while let Some(ev) = self.conn.poll_for_event()? {
+            match ev {
+                Event::DamageNotify(_) => self.dirty = true,
+                Event::XfixesCursorNotify(_) => {
+                    if let Some(c) = &mut self.cursor {
+                        c.stale = true;
+                        if self.draw_cursor {
+                            self.dirty = true;
+                        }
+                    }
+                }
+                Event::Error(e) => log::warn!("fd-capture: X error: {e:?}"),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Grab the screen (into the SHM segment, or `self.frame` without SHM) and draw the cursor.
+    /// With `copy`, the result is always in `self.frame` afterwards. With `only_if_changed`,
+    /// returns `Ok(false)` without grabbing when neither DAMAGE nor the cursor reported a change.
+    fn capture_inner(&mut self, only_if_changed: bool, copy: bool) -> anyhow::Result<bool> {
+        self.process_events()?;
+        let want_cursor = self.draw_cursor && self.cursor.is_some();
+        let fetch_shape = want_cursor && self.cursor.as_ref().is_some_and(|c| c.stale);
+
+        // Pointer position (one small round trip) — needed both to detect cursor motion and to
+        // place the cursor. A shape fetch returns the position too.
+        let mut pos = None;
+        if want_cursor && !fetch_shape {
+            let p = self.conn.query_pointer(self.root)?.reply()?;
+            if p.same_screen {
+                pos = Some((i32::from(p.root_x), i32::from(p.root_y)));
+            }
+            if self.cursor.as_ref().is_some_and(|c| c.last_pos != pos) {
+                self.dirty = true;
+            }
+        }
+        if only_if_changed && !self.dirty && self.damage.is_some() && !fetch_shape {
+            return Ok(false);
+        }
+
+        // Reset damage *before* grabbing so that anything drawn from now on re-notifies.
+        if let Some(d) = self.damage {
+            self.conn.damage_subtract(d, NONE, NONE)?;
+        }
+        let geom_cookie = self.conn.get_geometry(self.root)?;
+        let shape_cookie = if fetch_shape {
+            Some(self.conn.xfixes_get_cursor_image()?)
+        } else {
+            None
+        };
+        let (w, h) = (self.width as u16, self.height as u16);
+        let size = self.frame.data.len();
+        if let Some(shm) = &self.shm {
+            let cookie = self.conn.shm_get_image(
+                self.root,
+                0,
+                0,
+                w,
+                h,
+                ALL_PLANES,
+                ImageFormat::Z_PIXMAP.into(),
+                shm.seg,
+                0,
+            )?;
+            let geom = geom_cookie.reply()?;
+            let new = (u32::from(geom.width), u32::from(geom.height));
+            let reply = cookie.reply();
+            if new != (self.width, self.height) {
+                return Err(self.resized_error(new));
+            }
+            let reply = reply.context("XShmGetImage failed")?;
+            if reply.size as usize != size {
+                bail!(
+                    "XShmGetImage returned {} bytes, expected {size}",
+                    reply.size
+                );
+            }
+        } else {
+            let cookie =
+                self.conn
+                    .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, w, h, ALL_PLANES)?;
+            let geom = geom_cookie.reply()?;
+            let new = (u32::from(geom.width), u32::from(geom.height));
+            let reply = cookie.reply();
+            if new != (self.width, self.height) {
+                return Err(self.resized_error(new));
+            }
+            let reply = reply.context("XGetImage failed")?;
+            if reply.data.len() != size {
+                bail!(
+                    "XGetImage returned {} bytes, expected {size}",
+                    reply.data.len()
+                );
+            }
+            self.frame.data = reply.data;
+        }
+
+        if let Some(cookie) = shape_cookie {
+            let img = cookie.reply().context("XFixesGetCursorImage failed")?;
+            pos = Some((i32::from(img.x), i32::from(img.y)));
+            let c = self.cursor.as_mut().expect("cursor state");
+            c.stale = false;
+            let n = usize::from(img.width) * usize::from(img.height);
+            c.image = (img.width > 0
+                && img.height > 0
+                && img.width <= MAX_CURSOR_DIM
+                && img.height <= MAX_CURSOR_DIM
+                && img.cursor_image.len() >= n)
+                .then(|| CursorImage {
+                    width: usize::from(img.width),
+                    height: usize::from(img.height),
+                    xhot: i32::from(img.xhot),
+                    yhot: i32::from(img.yhot),
+                    pixels: img.cursor_image,
+                });
+        }
+        if want_cursor {
+            let c = self.cursor.as_mut().expect("cursor state");
+            c.last_pos = pos;
+            if let (Some(img), Some((x, y))) = (&c.image, pos) {
+                let buf = match &mut self.shm {
+                    Some(shm) => &mut shm.bytes_mut()[..size],
+                    None => &mut self.frame.data[..],
+                };
+                composite_cursor(
+                    buf,
+                    self.width,
+                    self.height,
+                    self.frame.stride,
+                    img,
+                    x - img.xhot,
+                    y - img.yhot,
+                );
+            }
+        }
+        if copy {
+            if let Some(shm) = &self.shm {
+                self.frame.data.copy_from_slice(&shm.bytes()[..size]);
+            }
+        }
+        self.dirty = false;
+        Ok(true)
+    }
+}
+
+/// Alpha-blend a premultiplied ARGB cursor onto a BGRX buffer at (x0, y0), clipped.
+fn composite_cursor(
+    data: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    img: &CursorImage,
+    x0: i32,
+    y0: i32,
+) {
+    let (fw, fh) = (width as i32, height as i32);
+    let xs = x0.max(0);
+    let xe = (x0 + img.width as i32).min(fw);
+    let ys = y0.max(0);
+    let ye = (y0 + img.height as i32).min(fh);
+    if xs >= xe || ys >= ye {
+        return;
+    }
+    for y in ys..ye {
+        let src =
+            &img.pixels[(y - y0) as usize * img.width..][(xs - x0) as usize..(xe - x0) as usize];
+        let dst = &mut data[y as usize * stride + xs as usize * 4..][..(xe - xs) as usize * 4];
+        for (d, &p) in dst.chunks_exact_mut(4).zip(src) {
+            let a = p >> 24;
+            if a == 0 {
+                continue;
+            }
+            let inv = 255 - a;
+            for (c, shift) in [(0usize, 0u32), (1, 8), (2, 16)] {
+                let s = (p >> shift) & 0xff;
+                d[c] = (s + (u32::from(d[c]) * inv + 127) / 255).min(255) as u8;
+            }
+        }
     }
 }
 
@@ -177,46 +491,38 @@ impl Capturer for X11Capturer {
     }
 
     fn capture(&mut self) -> anyhow::Result<&Frame> {
-        // Pipeline a geometry query with the image request: detects RandR resizes at no extra
-        // round trip. (If the root shrank, GetImage fails with BadMatch; if it grew, we'd
-        // silently capture a sub-rectangle — both are reported as ScreenResized.)
-        let geom_cookie = self.conn.get_geometry(self.root)?;
-        let (w, h) = (self.width as u16, self.height as u16);
-        let size = self.frame.data.len();
-        if let Some(shm) = &self.shm {
-            let cookie =
-                self.conn.shm_get_image(self.root, 0, 0, w, h, ALL_PLANES, ImageFormat::Z_PIXMAP.into(), shm.seg, 0)?;
-            let geom = geom_cookie.reply()?;
-            let new = (u32::from(geom.width), u32::from(geom.height));
-            let reply = cookie.reply();
-            if new != (self.width, self.height) {
-                return Err(self.resized_error(new));
-            }
-            let reply = reply.context("XShmGetImage failed")?;
-            if reply.size as usize != size {
-                bail!("XShmGetImage returned {} bytes, expected {size}", reply.size);
-            }
-            self.frame.data.copy_from_slice(&shm.bytes()[..size]);
-        } else {
-            let cookie = self.conn.get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, w, h, ALL_PLANES)?;
-            let geom = geom_cookie.reply()?;
-            let new = (u32::from(geom.width), u32::from(geom.height));
-            let reply = cookie.reply();
-            if new != (self.width, self.height) {
-                return Err(self.resized_error(new));
-            }
-            let reply = reply.context("XGetImage failed")?;
-            if reply.data.len() != size {
-                bail!("XGetImage returned {} bytes, expected {size}", reply.data.len());
-            }
-            self.frame.data = reply.data;
-        }
+        self.capture_inner(false, true)?;
         Ok(&self.frame)
+    }
+
+    fn capture_if_changed(&mut self) -> anyhow::Result<Option<FrameRef<'_>>> {
+        if !self.capture_inner(true, false)? {
+            return Ok(None);
+        }
+        Ok(Some(self.grabbed()))
+    }
+
+    fn capture_ref(&mut self) -> anyhow::Result<FrameRef<'_>> {
+        self.capture_inner(false, false)?;
+        Ok(self.grabbed())
+    }
+
+    fn set_draw_cursor(&mut self, on: bool) {
+        if on != self.draw_cursor {
+            self.draw_cursor = on;
+            self.dirty = true;
+            if let Some(c) = &mut self.cursor {
+                c.stale = true;
+            }
+        }
     }
 }
 
 impl Drop for X11Capturer {
     fn drop(&mut self) {
+        if let Some(d) = self.damage.take() {
+            let _ = self.conn.damage_destroy(d);
+        }
         if let Some(mut shm) = self.shm.take() {
             shm.release(&self.conn);
         }
@@ -227,19 +533,32 @@ impl Drop for X11Capturer {
 mod tests {
     use super::*;
 
+    fn open_or_skip() -> Option<X11Capturer> {
+        if std::env::var_os("DISPLAY").is_none() {
+            eprintln!("DISPLAY not set; skipping");
+            return None;
+        }
+        match X11Capturer::open(None) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("cannot open X display ({e:#}); skipping");
+                None
+            }
+        }
+    }
+
+    fn f_stride(c: &X11Capturer) -> usize {
+        c.frame.stride
+    }
+    fn f_len(c: &X11Capturer) -> usize {
+        c.frame.data.len()
+    }
+
     /// Needs a reachable X display; skipped otherwise.
     #[test]
     fn capture_root_if_display_available() {
-        if std::env::var_os("DISPLAY").is_none() {
-            eprintln!("DISPLAY not set; skipping");
+        let Some(mut cap) = open_or_skip() else {
             return;
-        }
-        let mut cap = match X11Capturer::open(None) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("cannot open X display ({e:#}); skipping");
-                return;
-            }
         };
         let (w, h) = cap.size();
         let f = cap.capture().expect("capture");
@@ -248,5 +567,98 @@ mod tests {
         assert_eq!(f.data.len(), f.stride * h as usize);
         // Second capture reuses the buffer.
         cap.capture().expect("capture 2");
+        // Zero-copy grab has the same geometry.
+        let v = cap.capture_ref().expect("capture_ref");
+        assert_eq!(
+            (v.width, v.height, v.stride, v.data.len()),
+            (w, h, f_stride(&cap), f_len(&cap))
+        );
+        // Without cursor drawing, capture_if_changed must work (Some or None) without error.
+        cap.set_draw_cursor(false);
+        cap.capture_if_changed().expect("capture_if_changed");
+    }
+
+    /// Maps a small override-redirect window for a moment (visible on the real screen!), so
+    /// it is ignored by default: `cargo test -p fd-capture -- --ignored`.
+    #[test]
+    #[ignore]
+    fn damage_detects_change() {
+        use x11rb::protocol::xproto::{CreateWindowAux, WindowClass};
+        use x11rb::COPY_DEPTH_FROM_PARENT;
+        let Some(mut cap) = open_or_skip() else {
+            return;
+        };
+        assert!(cap.has_damage());
+        cap.set_draw_cursor(false);
+        cap.capture().unwrap();
+        // Let any in-flight repaint settle, then expect "unchanged" at least once.
+        let mut unchanged = false;
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if cap.capture_if_changed().unwrap().is_none() {
+                unchanged = true;
+                break;
+            }
+        }
+        assert!(
+            unchanged,
+            "screen never reported unchanged (something animating?)"
+        );
+
+        let (conn, screen_num) = x11rb::connect(None).unwrap();
+        let screen = &conn.setup().roots[screen_num];
+        let win = conn.generate_id().unwrap();
+        let aux = CreateWindowAux::new()
+            .override_redirect(1)
+            .background_pixel(0x00ff_00ff);
+        conn.create_window(
+            COPY_DEPTH_FROM_PARENT,
+            win,
+            screen.root,
+            0,
+            0,
+            16,
+            16,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &aux,
+        )
+        .unwrap();
+        conn.map_window(win).unwrap();
+        conn.flush().unwrap();
+        let mut changed = false;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            if cap.capture_if_changed().unwrap().is_some() {
+                changed = true;
+                break;
+            }
+        }
+        conn.destroy_window(win).unwrap();
+        conn.flush().unwrap();
+        assert!(changed, "DAMAGE did not report the mapped window");
+    }
+
+    #[test]
+    fn cursor_blend_clips_and_blends() {
+        let mut f = vec![100u8; 32];
+        // 2x2 cursor: opaque red, transparent, 50% premultiplied white, opaque blue.
+        let img = CursorImage {
+            width: 2,
+            height: 2,
+            xhot: 0,
+            yhot: 0,
+            pixels: vec![0xffff_0000, 0x0000_0000, 0x8080_8080, 0xff00_00ff],
+        };
+        composite_cursor(&mut f, 4, 2, 16, &img, 3, 0); // only the left column is visible (x=3)
+        assert_eq!(&f[12..15], &[0, 0, 255]); // red -> B,G,R
+        let half = &f[16 + 12..16 + 15];
+        assert!(
+            half.iter()
+                .all(|&v| (v as i32 - (128 + 100 * 127 / 255)).abs() <= 1),
+            "{half:?}"
+        );
+        composite_cursor(&mut f, 4, 2, 16, &img, -5, -5); // fully off-screen: no panic
     }
 }

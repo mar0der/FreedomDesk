@@ -25,7 +25,14 @@ fn rgb4_to_uv(r: i32, g: i32, b: i32) -> (u8, u8) {
 
 /// Convert two rows of BGRX (each exactly `w*4` bytes, `w` even) to two Y rows + one U and V row.
 #[inline]
-fn bgrx_rows_to_i420(r0: &[u8], r1: &[u8], y0: &mut [u8], y1: &mut [u8], u: &mut [u8], v: &mut [u8]) {
+fn bgrx_rows_to_i420(
+    r0: &[u8],
+    r1: &[u8],
+    y0: &mut [u8],
+    y1: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+) {
     let it = r0
         .chunks_exact(8)
         .zip(r1.chunks_exact(8))
@@ -41,7 +48,11 @@ fn bgrx_rows_to_i420(r0: &[u8], r1: &[u8], y0: &mut [u8], y1: &mut [u8], u: &mut
         ya[1] = rgb_to_y(r01, g01, b01);
         yb[0] = rgb_to_y(r10, g10, b10);
         yb[1] = rgb_to_y(r11, g11, b11);
-        let (uu, vv) = rgb4_to_uv(r00 + r01 + r10 + r11, g00 + g01 + g10 + g11, b00 + b01 + b10 + b11);
+        let (uu, vv) = rgb4_to_uv(
+            r00 + r01 + r10 + r11,
+            g00 + g01 + g10 + g11,
+            b00 + b01 + b10 + b11,
+        );
         *uo = uu;
         *vo = vv;
     }
@@ -50,7 +61,11 @@ fn bgrx_rows_to_i420(r0: &[u8], r1: &[u8], y0: &mut [u8], y1: &mut [u8], u: &mut
 /// 2x2 box filter of two source rows into one BGRX row of `out.len()/4` pixels.
 #[inline]
 fn box2_row(a: &[u8], b: &[u8], out: &mut [u8]) {
-    for ((o, pa), pb) in out.chunks_exact_mut(4).zip(a.chunks_exact(8)).zip(b.chunks_exact(8)) {
+    for ((o, pa), pb) in out
+        .chunks_exact_mut(4)
+        .zip(a.chunks_exact(8))
+        .zip(b.chunks_exact(8))
+    {
         o[0] = ((pa[0] as u16 + pa[4] as u16 + pb[0] as u16 + pb[4] as u16 + 2) >> 2) as u8;
         o[1] = ((pa[1] as u16 + pa[5] as u16 + pb[1] as u16 + pb[5] as u16 + 2) >> 2) as u8;
         o[2] = ((pa[2] as u16 + pa[6] as u16 + pb[2] as u16 + pb[6] as u16 + 2) >> 2) as u8;
@@ -93,7 +108,11 @@ fn bilinear_taps(src: u32, dst: u32, unit: usize) -> Vec<Tap> {
             let s0 = s.floor() as u32;
             let s1 = (s0 + 1).min(src - 1);
             let f = ((s - s0 as f64) * 256.0).round() as u32;
-            Tap { i0: s0 as usize * unit, i1: s1 as usize * unit, f }
+            Tap {
+                i0: s0 as usize * unit,
+                i1: s1 as usize * unit,
+                f,
+            }
         })
         .collect()
 }
@@ -116,7 +135,10 @@ enum Kind {
     Copy,
     Box2,
     BoxK(usize),
-    Bilinear { xt: Vec<Tap>, yt: Vec<Tap> },
+    Bilinear {
+        xt: Vec<Tap>,
+        yt: Vec<Tap>,
+    },
 }
 
 /// BGRX -> I420 converter for fixed source and destination sizes.
@@ -141,15 +163,27 @@ impl ToI420 {
         } else if src_w % dst_w == 0 && src_h % dst_h == 0 && src_w / dst_w == src_h / dst_h {
             Kind::BoxK((src_w / dst_w) as usize)
         } else {
-            Kind::Bilinear { xt: bilinear_taps(src_w, dst_w, 4), yt: bilinear_taps(src_h, dst_h, 1) }
+            Kind::Bilinear {
+                xt: bilinear_taps(src_w, dst_w, 4),
+                yt: bilinear_taps(src_h, dst_h, 1),
+            }
         };
         // Bands of row pairs across a few threads; small frames aren't worth the spawn cost.
         let threads = if dst_w * dst_h >= 640 * 360 {
-            thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4)
+            thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .clamp(1, 4)
         } else {
             1
         };
-        Self { src_w, src_h, dst_w, dst_h, kind, threads }
+        Self {
+            src_w,
+            src_h,
+            dst_w,
+            dst_h,
+            kind,
+            threads,
+        }
     }
 
     pub(crate) fn kind_name(&self) -> &'static str {
@@ -162,7 +196,14 @@ impl ToI420 {
     }
 
     /// Convert; `y` is `dst_w*dst_h`, `u`/`v` are `dst_w/2 * dst_h/2`.
-    pub(crate) fn convert(&self, src: &[u8], stride: usize, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
+    pub(crate) fn convert(
+        &self,
+        src: &[u8],
+        stride: usize,
+        y: &mut [u8],
+        u: &mut [u8],
+        v: &mut [u8],
+    ) {
         let (w, h) = (self.dst_w as usize, self.dst_h as usize);
         assert!(stride >= self.src_w as usize * 4);
         assert!(src.len() >= stride * (self.src_h as usize - 1) + self.src_w as usize * 4);
@@ -187,7 +228,15 @@ impl ToI420 {
     }
 
     /// Convert the destination row pairs starting at `pair0` covering `y.len() / (2w)` pairs.
-    fn band(&self, src: &[u8], stride: usize, pair0: usize, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
+    fn band(
+        &self,
+        src: &[u8],
+        stride: usize,
+        pair0: usize,
+        y: &mut [u8],
+        u: &mut [u8],
+        v: &mut [u8],
+    ) {
         let w = self.dst_w as usize;
         let row_bytes = w * 4;
         let mut t0 = vec![0u8; row_bytes];
@@ -195,14 +244,24 @@ impl ToI420 {
         let src_row_bytes = self.src_w as usize * 4;
         let row = |r: usize| &src[r * stride..r * stride + src_row_bytes];
 
-        for (p, ((yy, uu), vv)) in
-            y.chunks_exact_mut(2 * w).zip(u.chunks_exact_mut(w / 2)).zip(v.chunks_exact_mut(w / 2)).enumerate()
+        for (p, ((yy, uu), vv)) in y
+            .chunks_exact_mut(2 * w)
+            .zip(u.chunks_exact_mut(w / 2))
+            .zip(v.chunks_exact_mut(w / 2))
+            .enumerate()
         {
             let dy = (pair0 + p) * 2;
             let (y0, y1) = yy.split_at_mut(w);
             match &self.kind {
                 Kind::Copy => {
-                    bgrx_rows_to_i420(&row(dy)[..row_bytes], &row(dy + 1)[..row_bytes], y0, y1, uu, vv);
+                    bgrx_rows_to_i420(
+                        &row(dy)[..row_bytes],
+                        &row(dy + 1)[..row_bytes],
+                        y0,
+                        y1,
+                        uu,
+                        vv,
+                    );
                     continue;
                 }
                 Kind::Box2 => {
@@ -234,7 +293,12 @@ fn clamp8(x: i32) -> u8 {
 fn i420_row_to_rgba(w: usize, yrow: &[u8], urow: &[u8], vrow: &[u8], orow: &mut [u8]) {
     let cw = w.div_ceil(2);
     let (yrow, urow, vrow) = (&yrow[..w], &urow[..cw], &vrow[..cw]);
-    for (((o, yp), &uu), &vv) in orow.chunks_exact_mut(8).zip(yrow.chunks_exact(2)).zip(urow).zip(vrow) {
+    for (((o, yp), &uu), &vv) in orow
+        .chunks_exact_mut(8)
+        .zip(yrow.chunks_exact(2))
+        .zip(urow)
+        .zip(vrow)
+    {
         let d = uu as i32 - 128;
         let e = vv as i32 - 128;
         let (ruv, guv, buv) = (409 * e + 128, -100 * d - 208 * e + 128, 516 * d + 128);
@@ -285,8 +349,13 @@ pub(crate) fn i420_to_rgba(
             i420_row_to_rgba(w, &y[r * ys..], &u[c * us..], &v[c * vs..], orow);
         }
     };
-    let threads =
-        if w * h >= 640 * 360 { thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4) } else { 1 };
+    let threads = if w * h >= 640 * 360 {
+        thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, 4)
+    } else {
+        1
+    };
     if threads == 1 {
         band(0, out);
         return;
@@ -305,7 +374,11 @@ mod tests {
     use super::*;
 
     fn solid(w: u32, h: u32, bgrx: [u8; 4]) -> Vec<u8> {
-        bgrx.iter().copied().cycle().take((w * h * 4) as usize).collect()
+        bgrx.iter()
+            .copied()
+            .cycle()
+            .take((w * h * 4) as usize)
+            .collect()
     }
 
     fn roundtrip(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32, bgr: [u8; 3]) {
@@ -318,7 +391,13 @@ mod tests {
         i420_to_rgba(w, h, &y, w, &u, w / 2, &v, w / 2, &mut rgba);
         for px in rgba.chunks_exact(4) {
             for (c, want) in [(0, bgr[2]), (1, bgr[1]), (2, bgr[0])] {
-                assert!((px[c] as i32 - want as i32).abs() <= 3, "{} kind: got {:?} want bgr {:?}", c, px, bgr);
+                assert!(
+                    (px[c] as i32 - want as i32).abs() <= 3,
+                    "{} kind: got {:?} want bgr {:?}",
+                    c,
+                    px,
+                    bgr
+                );
             }
             assert_eq!(px[3], 255);
         }
@@ -326,7 +405,14 @@ mod tests {
 
     #[test]
     fn colour_roundtrip_all_kinds() {
-        for bgr in [[0, 0, 0], [255, 255, 255], [0, 0, 255], [0, 255, 0], [255, 0, 0], [40, 120, 200]] {
+        for bgr in [
+            [0, 0, 0],
+            [255, 255, 255],
+            [0, 0, 255],
+            [0, 255, 0],
+            [255, 0, 0],
+            [40, 120, 200],
+        ] {
             roundtrip(64, 48, 64, 48, bgr); // copy
             roundtrip(65, 49, 64, 48, bgr); // copy w/ crop
             roundtrip(128, 96, 64, 48, bgr); // box2

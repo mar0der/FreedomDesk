@@ -10,4 +10,6 @@ license.workspace = true
 anyhow.workspace = true
 log.workspace = true
 openh264.workspace = true
+# Raw API for the encoder (multi-slice threading); same version the openh264 crate pulls in.
+openh264-sys2 = { version = "0.9", features = ["source"] }
 fd-capture.workspace = true

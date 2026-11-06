@@ -9,6 +9,7 @@ if [[ -z "${XAUTHORITY:-}" && -f /run/user/$(id -u)/gdm/Xauthority ]]; then
 fi
 PROFILE=${PROFILE:-release}
 FRAMES=${FRAMES:-150}
+SECONDS_MAX=${SECONDS_MAX:-3}
 RUNS=${RUNS:-1}
 PORT=${PORT:-47899}
 cargo build --profile "$PROFILE" -p freedomdesk -q
@@ -22,9 +23,10 @@ RUST_LOG=${RUST_LOG:-warn} $BIN --config-dir "$TMP/host" host --bind 127.0.0.1 -
 HOST_PID=$!
 sleep 1
 for i in $(seq 1 "$RUNS"); do
-  $BIN --config-dir "$TMP/viewer" view "127.0.0.1:$PORT" --headless --frames "$FRAMES" \
+  $BIN --config-dir "$TMP/viewer" view "127.0.0.1:$PORT" --headless --frames "$FRAMES" --seconds "$SECONDS_MAX" \
     --expect-fingerprint "$HOST_FP" 2>/dev/null
 done
+# The host only sends changed frames; a static desktop yields few, so we bound by time.
 # Negative test: a viewer expecting the wrong host key must be refused.
 if $BIN --config-dir "$TMP/viewer" view "127.0.0.1:$PORT" --headless --frames 1 \
      --expect-fingerprint AAAA-AAAA-AAAA-AAAA-AAAA-AAAA >/dev/null 2>&1; then

@@ -233,18 +233,35 @@ fn deny(w: &mut SecureWriter, reason: &str) -> Result<()> {
     w.send(&fd_proto::encode(&HostMsg::Denied { reason: reason.into() })?)
 }
 
+/// A converted picture plus the native screen size it came from.
+struct Pic {
+    pic: fd_codec::I420Frame,
+    src: (u32, u32),
+}
+
+/// Single-slot "latest frame wins" hand-off from the capture thread to the encoder.
+#[derive(Default)]
+struct Slot {
+    pic: Option<Pic>,
+    closed: bool,
+}
+
+fn pack(w: u32, h: u32) -> u64 {
+    ((w as u64) << 32) | h as u64
+}
+
 fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Result<()> {
     let args = &shared.args;
-    let mut capturer = fd_capture::open_default().context("opening screen capture")?;
+    let capturer = fd_capture::open_default().context("opening screen capture")?;
     let (sw, sh) = capturer.size();
     let cfg = fd_codec::EncoderConfig {
         max_width: args.max_width,
         max_height: args.max_height,
-        fps: args.fps,
+        fps: args.fps.clamp(1.0, 120.0),
         bitrate_bps: args.bitrate_kbps.saturating_mul(1000),
     };
-    let mut encoder = fd_codec::VideoEncoder::new(sw, sh, cfg).context("creating encoder")?;
-    let (vw, vh) = encoder.output_size();
+    let converter = fd_codec::Converter::new(sw, sh, &cfg).context("creating converter")?;
+    let (vw, vh) = converter.output_size();
     let injector = if args.view_only {
         None
     } else {
@@ -272,24 +289,33 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         video_width: vw,
         video_height: vh,
     })?;
-    log::info!("session with {viewer_name} started: screen {sw}x{sh} → video {vw}x{vh} @ {} fps", args.fps);
+    log::info!("session with {viewer_name} started: screen {sw}x{sh} → video {vw}x{vh} @ {} fps", cfg.fps);
 
     let stop = Arc::new(AtomicBool::new(false));
     let want_keyframe = Arc::new(AtomicBool::new(true));
+    let force_capture = Arc::new(AtomicBool::new(true));
+    let screen_size = Arc::new(std::sync::atomic::AtomicU64::new(pack(sw, sh)));
 
     // Input / control thread.
     let input_thread = {
         let stop = stop.clone();
         let want_keyframe = want_keyframe.clone();
+        let screen_size = screen_size.clone();
         let writer = writer.clone();
         let mut injector = injector;
         std::thread::Builder::new().name("host-input".into()).spawn(move || {
+            let mut size = pack(sw, sh);
             let result = (|| -> Result<()> {
                 loop {
                     let bytes = reader.recv()?;
                     match fd_proto::decode::<ViewerMsg>(&bytes)? {
                         ViewerMsg::Input(ev) => {
                             if let Some(inj) = injector.as_mut() {
+                                let now = screen_size.load(Ordering::Relaxed);
+                                if now != size {
+                                    size = now;
+                                    inj.set_screen_size((now >> 32) as u32, now as u32);
+                                }
                                 if let Err(e) = inj.inject(&ev) {
                                     log::warn!("inject {ev:?}: {e:#}");
                                 }
@@ -313,36 +339,123 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         })?
     };
 
-    // Video loop.
-    let interval = Duration::from_secs_f32(1.0 / args.fps.clamp(1.0, 120.0));
+    // Capture + convert thread → slot → encode + send (this thread).
+    let slot = Arc::new((Mutex::new(Slot::default()), std::sync::Condvar::new()));
+    let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<fd_codec::I420Frame>();
+    let capture_thread = {
+        let stop = stop.clone();
+        let slot = slot.clone();
+        let force_capture = force_capture.clone();
+        let screen_size = screen_size.clone();
+        let cfg = cfg.clone();
+        let mut capturer = capturer;
+        let mut converter = converter;
+        let interval = Duration::from_secs_f32(1.0 / cfg.fps);
+        std::thread::Builder::new().name("host-capture".into()).spawn(move || {
+            let result = (|| -> Result<()> {
+                while !stop.load(Ordering::SeqCst) {
+                    let tick = Instant::now();
+                    let grabbed = if force_capture.swap(false, Ordering::Relaxed) {
+                        capturer.capture_ref().map(Some)
+                    } else {
+                        capturer.capture_if_changed()
+                    };
+                    match grabbed {
+                        Ok(Some(view)) => {
+                            let mut pic = recycle_rx
+                                .try_iter()
+                                .find(|p| (p.width(), p.height()) == converter.output_size())
+                                .unwrap_or_else(|| converter.new_frame());
+                            converter.convert(view, &mut pic)?;
+                            let (lock, cv) = &*slot;
+                            let mut g = lock.lock().map_err(|_| anyhow!("slot poisoned"))?;
+                            g.pic = Some(Pic { pic, src: converter.source_size() });
+                            cv.notify_one();
+                        }
+                        Ok(None) => {}
+                        Err(e) if e.downcast_ref::<fd_capture::ScreenResized>().is_some() => {
+                            capturer = fd_capture::open_default().context("reopening capture after resize")?;
+                            let (w, h) = capturer.size();
+                            converter = fd_codec::Converter::new(w, h, &cfg)?;
+                            screen_size.store(pack(w, h), Ordering::Relaxed);
+                            force_capture.store(true, Ordering::Relaxed);
+                            log::info!("screen resized to {w}x{h}; video now {:?}", converter.output_size());
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    if let Some(rest) = interval.checked_sub(tick.elapsed()) {
+                        std::thread::sleep(rest);
+                    }
+                }
+                Ok(())
+            })();
+            stop.store(true, Ordering::SeqCst);
+            let (lock, cv) = &*slot;
+            if let Ok(mut g) = lock.lock() {
+                g.closed = true;
+            }
+            cv.notify_all();
+            result
+        })?
+    };
+
     let t0 = Instant::now();
     let mut seq = 0u64;
-    let mut video_result = Ok(());
-    while !stop.load(Ordering::SeqCst) && !shared.shutting_down.load(Ordering::SeqCst) {
-        let tick = Instant::now();
-        let r = (|| -> Result<()> {
-            let frame = capturer.capture()?;
-            let kf = want_keyframe.swap(false, Ordering::Relaxed);
-            if let Some(enc) = encoder.encode(frame, kf)? {
-                seq += 1;
-                send(&HostMsg::Video {
-                    seq,
-                    keyframe: enc.keyframe,
-                    ts_us: t0.elapsed().as_micros() as u64,
-                    data: enc.data,
-                })?;
+    let mut encoder: Option<(fd_codec::VideoEncoder, (u32, u32))> = None;
+    let mut last: Option<Pic> = None;
+    let video_result = (|| -> Result<()> {
+        loop {
+            if stop.load(Ordering::SeqCst) || shared.shutting_down.load(Ordering::SeqCst) {
+                return Ok(());
             }
-            Ok(())
-        })();
-        if let Err(e) = r {
-            video_result = Err(e);
-            break;
+            let fresh = {
+                let (lock, cv) = &*slot;
+                let g = lock.lock().map_err(|_| anyhow!("slot poisoned"))?;
+                let (mut g, _) = cv
+                    .wait_timeout_while(g, Duration::from_millis(100), |s| s.pic.is_none() && !s.closed)
+                    .map_err(|_| anyhow!("slot poisoned"))?;
+                if g.closed && g.pic.is_none() {
+                    return Ok(());
+                }
+                g.pic.take()
+            };
+            let kf = want_keyframe.swap(false, Ordering::Relaxed);
+            if let Some(p) = fresh {
+                if let Some(old) = last.replace(p) {
+                    let _ = recycle_tx.send(old.pic);
+                }
+            } else if !kf {
+                continue; // nothing new on screen
+            }
+            let Some(pic) = last.as_ref() else {
+                // Keyframe wanted before anything was captured: ask for a full grab.
+                want_keyframe.store(true, Ordering::Relaxed);
+                force_capture.store(true, Ordering::Relaxed);
+                continue;
+            };
+            if encoder.as_ref().is_none_or(|(_, src)| *src != pic.src) {
+                encoder = Some((fd_codec::VideoEncoder::new(pic.src.0, pic.src.1, cfg.clone())?, pic.src));
+            }
+            let (enc, _) = encoder.as_mut().expect("encoder just set");
+            match enc.encode_i420(&pic.pic, kf)? {
+                Some(out) => {
+                    seq += 1;
+                    send(&HostMsg::Video {
+                        seq,
+                        keyframe: out.keyframe,
+                        ts_us: t0.elapsed().as_micros() as u64,
+                        data: out.data,
+                    })?;
+                }
+                None if kf => want_keyframe.store(true, Ordering::Relaxed), // rate control skipped it
+                None => {}
+            }
         }
-        if let Some(rest) = interval.checked_sub(tick.elapsed()) {
-            std::thread::sleep(rest);
-        }
-    }
+    })();
     stop.store(true, Ordering::SeqCst);
+    let capture_result = capture_thread.join().map_err(|_| anyhow!("capture thread panicked"))?;
+    let video_result = video_result.and(capture_result);
     if video_result.is_ok() {
         let _ = send(&HostMsg::Bye { reason: "host ended session".into() });
     }

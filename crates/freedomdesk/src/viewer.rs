@@ -24,6 +24,10 @@ pub struct ViewArgs {
     /// Headless: stop after this many decoded frames.
     #[arg(long, default_value_t = 150)]
     frames: u64,
+    /// Headless: also stop after this many seconds (0 = no limit). The host only
+    /// sends frames when the screen changes, so a static desktop yields few frames.
+    #[arg(long, default_value_t = 0.0)]
+    seconds: f64,
     /// Name shown to the host user in the consent prompt.
     #[arg(long)]
     name: Option<String>,
@@ -43,7 +47,7 @@ struct Connected {
 pub fn run(dir: &Path, args: ViewArgs) -> Result<()> {
     let conn = connect(dir, &args)?;
     if args.headless {
-        headless(conn, args.frames)
+        headless(conn, args.frames, args.seconds)
     } else {
         gui(conn)
     }
@@ -253,7 +257,7 @@ impl GatedDecoder {
 
 // ---------------------------------------------------------------- headless
 
-fn headless(conn: Connected, want: u64) -> Result<()> {
+fn headless(conn: Connected, want: u64, seconds: f64) -> Result<()> {
     let t0 = Instant::now();
     let (tx, rx) = mpsc::channel();
     let shutdown = conn.writer.shutdown_handle()?;
@@ -265,7 +269,7 @@ fn headless(conn: Connected, want: u64) -> Result<()> {
     let mut dims = (0, 0);
     let start = Instant::now();
     let mut first_frame = None;
-    while st.frames < want {
+    while st.frames < want && (seconds <= 0.0 || start.elapsed().as_secs_f64() < seconds) {
         let msg: HostMsg = fd_proto::decode(&reader.recv()?)?;
         match msg {
             HostMsg::Video { data, keyframe, .. } => {

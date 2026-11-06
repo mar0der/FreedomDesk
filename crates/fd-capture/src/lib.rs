@@ -19,11 +19,60 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
+impl Frame {
+    /// Borrowed view of this frame.
+    pub fn view(&self) -> FrameRef<'_> {
+        FrameRef {
+            width: self.width,
+            height: self.height,
+            stride: self.stride,
+            data: &self.data,
+        }
+    }
+}
+
+/// Borrowed captured frame, same layout as [`Frame`] (BGRX, top-down, `stride` bytes per row).
+/// Returned by [`Capturer::capture_if_changed`] without copying (e.g. straight out of the X
+/// shared-memory segment); the borrow ends at the next capture call.
+#[derive(Clone, Copy)]
+pub struct FrameRef<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub stride: usize,
+    pub data: &'a [u8],
+}
+
+impl<'a> From<&'a Frame> for FrameRef<'a> {
+    fn from(f: &'a Frame) -> Self {
+        f.view()
+    }
+}
+
 pub trait Capturer: Send {
     /// Native size of the captured area in pixels.
     fn size(&self) -> (u32, u32);
     /// Grab the current screen contents. The returned frame is reused between calls.
     fn capture(&mut self) -> anyhow::Result<&Frame>;
+
+    /// Grab the screen unless nothing changed since the previous capture (either kind):
+    /// returns `Ok(None)` cheaply, without grabbing, when neither the screen contents nor the
+    /// cursor (position/shape, if drawn) changed. Backends that cannot tell always grab.
+    ///
+    /// Zero-copy where possible (X11: borrowed straight from the MIT-SHM segment), so prefer
+    /// this over `capture()` in the streaming loop. Use `capture()` for an unconditional grab
+    /// (e.g. the first frame / keyframe requests) — after `capture()` the next
+    /// `capture_if_changed()` is relative to that grab.
+    fn capture_if_changed(&mut self) -> anyhow::Result<Option<FrameRef<'_>>> {
+        self.capture().map(|f| Some(f.view()))
+    }
+
+    /// Unconditional grab, zero-copy where possible (see `capture_if_changed`).
+    fn capture_ref(&mut self) -> anyhow::Result<FrameRef<'_>> {
+        self.capture().map(|f| f.view())
+    }
+
+    /// Draw the mouse cursor into captured frames (default: on, where supported).
+    fn set_draw_cursor(&mut self, _on: bool) {}
 }
 
 /// Returned (inside `anyhow::Error`) by [`Capturer::capture`] when the captured screen changed
