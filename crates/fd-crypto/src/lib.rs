@@ -71,6 +71,11 @@ impl Identity {
         let text = Zeroizing::new(
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
         );
+        Self::from_text(&text)
+    }
+
+    /// Parse the identity file format (see `to_text`).
+    pub fn from_text(text: &str) -> Result<Self> {
         let mut private = None;
         let mut public = None;
         for line in text.lines() {
@@ -112,6 +117,11 @@ impl Identity {
             create_private_dir(dir)?;
         }
         write_private_file(path, self.serialize().as_bytes())
+    }
+
+    /// The identity file format, e.g. to hand the key to a child process on a pipe.
+    pub fn to_text(&self) -> Zeroizing<String> {
+        self.serialize()
     }
 
     fn serialize(&self) -> Zeroizing<String> {

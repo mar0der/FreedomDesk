@@ -6,6 +6,8 @@ mod host;
 mod keymap;
 mod launcher;
 mod netpolicy;
+#[cfg(target_os = "linux")]
+mod service;
 mod viewer;
 
 use anyhow::Result;
@@ -35,6 +37,10 @@ enum Cmd {
     View(viewer::ViewArgs),
     /// Allow a viewer to connect to this host without a consent prompt (unattended).
     Authorize(authorized::AuthorizeArgs),
+    /// Run as a root system service: follow the console (login screen or
+    /// desktop) and host it as that session's user. Linux, X11.
+    #[cfg(target_os = "linux")]
+    Service(service::ServiceArgs),
     /// (internal) Show the host-side consent dialog. Exit code 0 = allowed.
     #[command(hide = true)]
     Consent(consent::ConsentArgs),
@@ -74,5 +80,7 @@ fn main() -> Result<()> {
         Cmd::View(a) => viewer::run(&dir, a),
         Cmd::Authorize(a) => authorized::run(&dir, a),
         Cmd::Consent(a) => consent::run(a),
+        #[cfg(target_os = "linux")]
+        Cmd::Service(a) => service::run(&dir, a),
     }
 }

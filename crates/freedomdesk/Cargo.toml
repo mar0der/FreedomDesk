@@ -18,3 +18,5 @@ fd-crypto.workspace = true
 fd-capture.workspace = true
 fd-codec.workspace = true
 fd-input.workspace = true
+zeroize.workspace = true
+libc.workspace = true

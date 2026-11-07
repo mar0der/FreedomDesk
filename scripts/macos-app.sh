@@ -4,7 +4,7 @@
 # Usage: scripts/macos-app.sh target/release/freedomdesk dist/
 set -euo pipefail
 bin=$1 out=$2
-version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)
 build=${GITHUB_RUN_NUMBER:-0}
 app="$out/FreedomDesk.app"
 rm -rf "$app"

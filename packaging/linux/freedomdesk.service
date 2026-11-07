@@ -1,0 +1,32 @@
+[Unit]
+Description=FreedomDesk host (follows the console: login screen, lock screen, desktop)
+Documentation=https://github.com/mar0der/FreedomDesk
+After=network-online.target tailscaled.service systemd-logind.service display-manager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root supervisor: finds the active seat0 X11 session and runs `freedomdesk host`
+# as that session's user (gdm for the greeter, the user for the desktop).
+# Binds the Tailscale IP only. Identity: /etc/freedomdesk/identity.key (root 0600).
+ExecStart=/usr/local/bin/freedomdesk --config-dir /etc/freedomdesk service
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

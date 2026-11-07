@@ -1133,7 +1133,9 @@ dependencies = [
  "fd-crypto",
  "fd-input",
  "fd-proto",
+ "libc",
  "log",
+ "zeroize",
 ]
 
 [[package]]

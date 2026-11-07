@@ -75,6 +75,10 @@ pub trait ConnectUi {
     fn trust(&mut self, prompt: &TrustPrompt) -> bool;
     /// Called once the socket exists, so a GUI can abort a pending connect.
     fn cancel_handle(&mut self, _h: fd_crypto::ShutdownHandle) {}
+    /// The user gave up; stop before doing anything the host would see.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 struct TermUi {
@@ -137,6 +141,9 @@ pub fn connect(dir: &Path, args: &ConnectOpts, ui: &mut dyn ConnectUi) -> Result
     if let Ok(s) = stream.try_clone() {
         ui.cancel_handle(fd_crypto::ShutdownHandle::from(s));
     }
+    if ui.cancelled() {
+        bail!("cancelled");
+    }
     let mut session = fd_crypto::connect(stream, &identity).context("secure handshake")?;
     let host_fp = session.remote_fingerprint();
 
@@ -176,6 +183,9 @@ pub fn connect(dir: &Path, args: &ConnectOpts, ui: &mut dyn ConnectUi) -> Result
         let user = std::env::var("USER").unwrap_or_else(|_| "someone".into());
         format!("{user}@{}", crate::host::hostname())
     });
+    if ui.cancelled() {
+        bail!("cancelled");
+    }
     session.writer.send(&fd_proto::encode(&ViewerMsg::Hello { protocol: PROTOCOL_VERSION, viewer_name })?)?;
     ui.status("Secure channel up. Waiting for the host to allow the session …");
 

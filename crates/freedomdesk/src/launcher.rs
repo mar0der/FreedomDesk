@@ -7,7 +7,6 @@ use anyhow::{bail, Context, Result};
 use eframe::egui;
 use fd_crypto::{normalize_fingerprint, ShutdownHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -67,7 +66,8 @@ pub fn load_machines(dir: &Path) -> Result<Vec<Machine>> {
     };
     let mut out = Vec::new();
     for line in text.lines() {
-        if line.trim().is_empty() || line.starts_with('#') {
+        // Comments are whole lines without a tab (a name may start with '#').
+        if line.trim().is_empty() || (line.starts_with('#') && !line.contains('\t')) {
             continue;
         }
         let mut f = line.split('\t');
@@ -85,8 +85,9 @@ pub fn save_machines(dir: &Path, machines: &[Machine]) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = machines_path(dir);
     let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp); // a stale tmp could carry looser permissions
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -112,11 +113,20 @@ enum WorkerMsg {
     Done(Result<Connected>),
 }
 
+/// Cancel flag and the socket to shut down, under one lock so neither side
+/// can miss the other.
+#[derive(Default)]
+struct CancelState {
+    cancelled: bool,
+    socket: Option<ShutdownHandle>,
+}
+
+type Cancel = Arc<Mutex<CancelState>>;
+
 struct GuiUi {
     tx: Sender<WorkerMsg>,
     ctx: egui::Context,
-    cancel: Arc<Mutex<Option<ShutdownHandle>>>,
-    cancelled: Arc<AtomicBool>,
+    cancel: Cancel,
 }
 
 impl ConnectUi for GuiUi {
@@ -134,10 +144,14 @@ impl ConnectUi for GuiUi {
         rrx.recv().unwrap_or(false) // launcher dropped the sender (cancel) = no
     }
     fn cancel_handle(&mut self, h: ShutdownHandle) {
-        if self.cancelled.load(Ordering::SeqCst) {
+        let mut c = self.cancel.lock().unwrap();
+        if c.cancelled {
             h.shutdown();
         }
-        *self.cancel.lock().unwrap() = Some(h);
+        c.socket = Some(h);
+    }
+    fn cancelled(&self) -> bool {
+        self.cancel.lock().unwrap().cancelled
     }
 }
 
@@ -148,14 +162,14 @@ struct Connecting {
     rx: Receiver<WorkerMsg>,
     status: String,
     trust: Option<(TrustPrompt, Sender<bool>)>,
-    cancel: Arc<Mutex<Option<ShutdownHandle>>>,
-    cancelled: Arc<AtomicBool>,
+    cancel: Cancel,
 }
 
 impl Connecting {
     fn abort(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-        if let Some(h) = self.cancel.lock().unwrap().as_ref() {
+        let mut c = self.cancel.lock().unwrap();
+        c.cancelled = true;
+        if let Some(h) = &c.socket {
             h.shutdown();
         }
     }
@@ -188,6 +202,8 @@ pub struct FdApp {
     quick: String,
     error: Option<String>,
     notice: Option<String>,
+    /// The machines file exists but could not be read: never overwrite it.
+    load_failed: bool,
 }
 
 const TITLE: &str = "FreedomDesk";
@@ -197,8 +213,9 @@ impl FdApp {
         let my_fingerprint = crate::load_identity(dir).map(|i| i.fingerprint()).unwrap_or_else(|e| format!("(error: {e:#})"));
         let (machines, error) = match load_machines(dir) {
             Ok(m) => (m, None),
-            Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+            Err(e) => (Vec::new(), Some(format!("{e:#} — saved machines are read-only until this is fixed"))),
         };
+        let load_failed = error.is_some();
         let mut app = FdApp {
             dir: dir.to_path_buf(),
             my_fingerprint,
@@ -209,6 +226,7 @@ impl FdApp {
             quick: String::new(),
             error,
             notice: None,
+            load_failed,
         };
         if let Some(c) = conn {
             app.enter_session(c, ctx);
@@ -232,6 +250,9 @@ impl FdApp {
     }
 
     fn save(&mut self) {
+        if self.load_failed {
+            return;
+        }
         if let Err(e) = save_machines(&self.dir, &self.machines) {
             self.error = Some(format!("could not save machines: {e:#}"));
         }
@@ -241,9 +262,8 @@ impl FdApp {
         self.error = None;
         self.notice = None;
         let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(Mutex::new(None));
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let mut ui = GuiUi { tx: tx.clone(), ctx: ctx.clone(), cancel: cancel.clone(), cancelled: cancelled.clone() };
+        let cancel: Cancel = Arc::default();
+        let mut ui = GuiUi { tx: tx.clone(), ctx: ctx.clone(), cancel: cancel.clone() };
         let opts = ConnectOpts { host: machine.address.clone(), expect_fingerprint: machine.fingerprint.clone(), name: None };
         let dir = self.dir.clone();
         let ctx2 = ctx.clone();
@@ -259,7 +279,6 @@ impl FdApp {
             rx,
             trust: None,
             cancel,
-            cancelled,
         }));
     }
 
@@ -332,7 +351,7 @@ impl FdApp {
             ui.horizontal(|ui| {
                 ui.strong("Machines");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("➕ Add machine").clicked() {
+                    if ui.add_enabled(self.editor.is_none() && self.confirm_remove.is_none(), egui::Button::new("➕ Add machine")).clicked() {
                         self.editor = Some(Editor { index: None, name: String::new(), address: String::new(), fingerprint: String::new(), error: None });
                     }
                 });
@@ -343,6 +362,8 @@ impl FdApp {
                 ui.weak("No saved machines yet. Add one, or type an address below.");
                 ui.add_space(12.0);
             }
+            let dialog_open = self.editor.is_some() || self.confirm_remove.is_some();
+            ui.add_enabled_ui(!dialog_open, |ui| {
             egui::ScrollArea::vertical().max_height(ui.available_height() - 70.0).show(ui, |ui| {
                 egui::Grid::new("fd-machines").num_columns(4).spacing([16.0, 10.0]).striped(true).show(ui, |ui| {
                     for (i, m) in self.machines.iter().enumerate() {
@@ -386,13 +407,18 @@ impl FdApp {
                 if (ui.button("Connect").clicked() || enter) && !self.quick.trim().is_empty() {
                     match Machine::new("", &self.quick, "") {
                         Ok(m) => {
-                        connect = Some((m, None));
-                        self.quick.clear();
-                    }
+                            // Same address as a saved machine: use it, so its pinned fingerprint applies.
+                            connect = Some(match self.machines.iter().position(|s| s.address == m.address) {
+                                Some(i) => (self.machines[i].clone(), Some(i)),
+                                None => (m, None),
+                            });
+                            self.quick.clear();
+                        }
                         Err(e) => self.error = Some(format!("{e:#}")),
                     }
                 }
             });
+            }); // add_enabled_ui
         });
 
         self.editor_window(ctx);

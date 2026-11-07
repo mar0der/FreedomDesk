@@ -48,6 +48,14 @@ pub struct HostArgs {
     /// Exit after the first session ends (useful for tests).
     #[arg(long)]
     once: bool,
+    /// (internal, used by `freedomdesk service`) Read the identity key from stdin
+    /// instead of <config>/identity.key.
+    #[arg(long, hide = true)]
+    identity_stdin: bool,
+    /// Audit log file; `-` = log to stderr (journald under the service).
+    /// Default: <config>/audit.log
+    #[arg(long, value_name = "PATH")]
+    audit_log: Option<PathBuf>,
 }
 
 struct Shared {
@@ -79,7 +87,14 @@ pub fn run(dir: &Path, args: HostArgs) -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("hosting is Linux-only for now (macOS/Windows hosts are milestone M7); this build can view other machines");
     }
-    let identity = load_identity(dir)?;
+    let identity = if args.identity_stdin {
+        use std::io::Read;
+        let mut text = zeroize::Zeroizing::new(String::new());
+        std::io::stdin().take(4096).read_to_string(&mut text).context("reading identity from stdin")?;
+        fd_crypto::Identity::from_text(&text)?
+    } else {
+        load_identity(dir)?
+    };
     let addr = netpolicy::resolve_bind(args.bind.as_deref(), args.port, args.allow_public_bind)?;
     let listener = TcpListener::bind(addr).with_context(|| format!("listening on {addr}"))?;
     let host_name = hostname();
@@ -94,11 +109,12 @@ pub fn run(dir: &Path, args: HostArgs) -> Result<()> {
         println!("Authorised viewers file: {} entr{} (re-read on each connection)", listed.len(), if listed.len() == 1 { "y" } else { "ies" });
     }
     let once = args.once;
+    let audit_path = args.audit_log.clone().unwrap_or_else(|| dir.join("audit.log"));
     let shared = Arc::new(Shared {
         args,
         identity,
         host_name,
-        audit_path: dir.join("audit.log"),
+        audit_path,
         config_dir: dir.to_path_buf(),
         busy: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
@@ -663,6 +679,10 @@ fn audit(shared: &Shared, peer: &SocketAddr, name: &str, fp: &str, outcome: &str
         outcome.replace('"', "'"),
         dur.as_secs()
     );
+    if shared.audit_path.as_os_str() == "-" {
+        log::info!(target: "audit", "{}", line.trim_end());
+        return;
+    }
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
