@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -276,6 +276,8 @@ struct Pic {
     max: (u32, u32),
     region: Rect,
     screen: (u32, u32),
+    /// Quality level the output size was chosen for (bitrate must match it).
+    level: usize,
 }
 
 /// Single-slot "latest frame wins" hand-off from the capture thread to the encoder.
@@ -328,6 +330,15 @@ const CALM_FOR: Duration = Duration::from_secs(6);
 const GATE_S: f64 = 0.3;
 const STATS_EVERY: Duration = Duration::from_secs(10);
 
+fn level_bitrate(level: usize, base: u32) -> u32 {
+    let level = level.min(QUALITY_LEVELS.len() - 1);
+    ((base as f64 * QUALITY_LEVELS[level].0 as f64) as u32).max(MIN_BITRATE_BPS.min(base))
+}
+
+fn level_scale(level: usize) -> u32 {
+    (QUALITY_LEVELS[level.min(QUALITY_LEVELS.len() - 1)].1 * 1000.0).round() as u32
+}
+
 /// Adaptive quality from the kernel send queue (no viewer cooperation needed).
 struct Adapt {
     level: usize,
@@ -343,11 +354,11 @@ impl Adapt {
     }
 
     fn bitrate(&self, base: u32) -> u32 {
-        ((base as f64 * QUALITY_LEVELS[self.level].0 as f64) as u32).max(MIN_BITRATE_BPS.min(base))
+        level_bitrate(self.level, base)
     }
 
     fn scale_permille(&self) -> u32 {
-        (QUALITY_LEVELS[self.level].1 * 1000.0).round() as u32
+        level_scale(self.level)
     }
 
     /// Feed one queue-delay sample; returns true if the level changed.
@@ -465,7 +476,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
     let screen_size = Arc::new(std::sync::atomic::AtomicU64::new(pack(sw, sh)));
     let view_req = Arc::new(Mutex::new(ViewReq::FULL));
     let counters = Arc::new(Counters::default());
-    let quality_scale = Arc::new(AtomicU32::new(1000));
+    let quality_level = Arc::new(AtomicUsize::new(0));
     let started = Instant::now();
 
     // Input / control thread.
@@ -550,7 +561,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         let writer = writer.clone();
         let base_cfg = base_cfg.clone();
         let args = args.clone();
-        let quality_scale = quality_scale.clone();
+        let quality_level = quality_level.clone();
         let viewer_name = viewer_name.to_string();
         let interval = Duration::from_secs_f32(1.0 / base_cfg.fps);
         std::thread::Builder::new().name("host-capture".into()).spawn(move || {
@@ -620,7 +631,8 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                         force_capture.store(true, Ordering::Relaxed); // new region: grab even if static
                     }
                     let crop = crop_rect(req, sw, sh);
-                    let max = out_bounds(&args, req, quality_scale.load(Ordering::Relaxed));
+                    let level = quality_level.load(Ordering::Relaxed);
+                    let max = out_bounds(&args, req, level_scale(level));
                     let key = ((crop.w, crop.h), max);
                     if converter.is_none() || conv_key != key {
                         let cfg = fd_codec::EncoderConfig { max_width: max.0, max_height: max.1, ..base_cfg.clone() };
@@ -645,7 +657,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                             conv.convert(sub, &mut pic)?;
                             let (lock, cv) = &*slot;
                             let mut g = lock.lock().map_err(|_| anyhow!("slot poisoned"))?;
-                            g.pic = Some(Pic { pic, src: (crop.w, crop.h), max, region: crop, screen: (sw, sh) });
+                            g.pic = Some(Pic { pic, src: (crop.w, crop.h), max, region: crop, screen: (sw, sh), level });
                             cv.notify_one();
                         }
                         Ok(None) => {}
@@ -723,7 +735,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
             let delay = queued.map_or(0.0, |q| q as f64 * 8.0 / bps as f64);
             max_queue = max_queue.max(queued.unwrap_or(0));
             if adapt.update(delay, seq, now) {
-                quality_scale.store(adapt.scale_permille(), Ordering::Relaxed);
+                quality_level.store(adapt.level, Ordering::Relaxed);
                 log::info!(
                     "session with {viewer_name}: quality level {} ({} kbps, {}% size); send queue {:.0} ms",
                     adapt.level,
@@ -751,6 +763,9 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
 
             let kf = want_keyframe.swap(false, Ordering::Relaxed);
             if let Some(p) = fresh {
+                if pending {
+                    held += 1; // a picture that never went out (slow link)
+                }
                 if let Some(old) = last.replace(p) {
                     let _ = recycle_tx.send(old.pic);
                 }
@@ -761,7 +776,6 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
             }
             // Link can't keep up: hold the newest picture until the queue drains.
             if delay > GATE_S {
-                held += 1;
                 if kf {
                     want_keyframe.store(true, Ordering::Relaxed);
                 }
@@ -774,6 +788,8 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                 continue;
             };
             pending = false;
+            // Bitrate of the level this picture was sized for: one encoder rebuild (IDR) per step.
+            let bps = level_bitrate(pic.level, base_cfg.bitrate_bps);
             let key = (pic.src, pic.max, bps);
             if encoder.as_ref().is_none_or(|(_, k)| *k != key) {
                 let cfg = fd_codec::EncoderConfig { max_width: pic.max.0, max_height: pic.max.1, bitrate_bps: bps, ..base_cfg.clone() };

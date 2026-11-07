@@ -755,7 +755,9 @@ impl ViewerApp {
         if self.view_candidate.is_none_or(|(v, _)| v != want) {
             self.view_candidate = Some((want, Instant::now()));
         }
-        let settled = self.view_candidate.is_some_and(|(_, t)| t.elapsed() >= VIEW_SETTLE);
+        // A pan (same output size) costs the host no encoder rebuild: no need to wait.
+        let pan_only = self.last_view_sent.is_some_and(|v| (v.4, v.5) == (want.4, want.5));
+        let settled = pan_only || self.view_candidate.is_some_and(|(_, t)| t.elapsed() >= VIEW_SETTLE);
         if self.last_view_sent != Some(want) && settled && self.last_view_time.elapsed() >= VIEW_SEND_INTERVAL && self.ended.is_none() {
             self.last_view_sent = Some(want);
             self.last_view_time = Instant::now();
