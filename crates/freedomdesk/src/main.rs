@@ -1,11 +1,15 @@
 //! FreedomDesk — one binary that is both host agent and viewer.
 
+mod agent;
+#[cfg(test)]
+mod agent_loopback;
 mod authorized;
 mod clipboard;
 mod consent;
 mod host;
 mod keymap;
 mod launcher;
+mod mcp;
 mod netpolicy;
 #[cfg(target_os = "linux")]
 mod service;
@@ -38,6 +42,10 @@ enum Cmd {
     View(viewer::ViewArgs),
     /// Allow a viewer to connect to this host without a consent prompt (unattended).
     Authorize(authorized::AuthorizeArgs),
+    /// Computer control for AI agents: one-shot commands that print JSON.
+    Agent(agent::AgentArgs),
+    /// Run an MCP (Model Context Protocol) server on stdio for AI agents.
+    Mcp,
     /// Run as a root system service: follow the console (login screen or
     /// desktop) and host it as that session's user. Linux, X11.
     #[cfg(target_os = "linux")]
@@ -80,6 +88,8 @@ fn main() -> Result<()> {
         Cmd::Host(a) => host::run(&dir, a),
         Cmd::View(a) => viewer::run(&dir, a),
         Cmd::Authorize(a) => authorized::run(&dir, a),
+        Cmd::Agent(a) => std::process::exit(agent::run(&dir, a)),
+        Cmd::Mcp => mcp::run(&dir),
         Cmd::Consent(a) => consent::run(a),
         #[cfg(target_os = "linux")]
         Cmd::Service(a) => service::run(&dir, a),

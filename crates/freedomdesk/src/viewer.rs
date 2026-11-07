@@ -56,6 +56,16 @@ pub struct Connected {
 }
 
 impl Connected {
+    /// Take the channel halves apart (for the non-GUI agent session).
+    pub(crate) fn into_parts(self) -> (SecureReader, SecureWriter) {
+        (self.reader, self.writer)
+    }
+    pub(crate) fn screen_size(&self) -> (u32, u32) {
+        self.screen_size
+    }
+    pub(crate) fn clipboard_caps(&self) -> u32 {
+        self.clipboard_caps
+    }
     pub fn video_size(&self) -> (u32, u32) {
         self.video_size
     }
@@ -83,6 +93,11 @@ pub trait ConnectUi {
     fn trust(&mut self, prompt: &TrustPrompt) -> bool;
     /// Called once the socket exists, so a GUI can abort a pending connect.
     fn cancel_handle(&mut self, _h: fd_crypto::ShutdownHandle) {}
+    /// Called with the pinned/verified host fingerprint BEFORE `Hello` is sent
+    /// (so before the host user sees any prompt). `Err(reason)` aborts.
+    fn check_peer(&mut self, _fingerprint: &str) -> std::result::Result<(), String> {
+        Ok(())
+    }
     /// The user gave up; stop before doing anything the host would see.
     fn cancelled(&self) -> bool {
         false
@@ -122,7 +137,7 @@ pub fn run(dir: &Path, args: ViewArgs) -> Result<()> {
     }
 }
 
-fn split_host(s: &str) -> (String, u16) {
+pub(crate) fn split_host(s: &str) -> (String, u16) {
     // [v6]:port, v4:port, name:port, or bare host.
     if let Some(rest) = s.strip_prefix('[') {
         if let Some((h, p)) = rest.split_once("]:") {
@@ -196,6 +211,9 @@ pub fn connect(dir: &Path, args: &ConnectOpts, ui: &mut dyn ConnectUi) -> Result
         let user = std::env::var("USER").unwrap_or_else(|_| "someone".into());
         format!("{user}@{}", crate::host::hostname())
     });
+    if let Err(reason) = ui.check_peer(&host_fp) {
+        bail!("{reason}");
+    }
     if ui.cancelled() {
         bail!("cancelled");
     }
@@ -246,11 +264,11 @@ fn confirm(prompt: &str) -> Result<bool> {
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-fn clean(s: &str) -> String {
+pub(crate) fn clean(s: &str) -> String {
     crate::consent::sanitize(s, 120)
 }
 
-fn now_us(t0: Instant) -> u64 {
+pub(crate) fn now_us(t0: Instant) -> u64 {
     t0.elapsed().as_micros() as u64
 }
 
@@ -290,7 +308,7 @@ fn apply_host_clipboard(clip: Option<&clipboard::SharedEngine>, text: &str) {
 }
 
 /// Writer thread: drains the outgoing queue, pings once a second.
-fn spawn_writer(mut writer: SecureWriter, rx: Receiver<ViewerMsg>, t0: Instant) -> std::thread::JoinHandle<()> {
+pub(crate) fn spawn_writer(mut writer: SecureWriter, rx: Receiver<ViewerMsg>, t0: Instant) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last_ping = Instant::now() - Duration::from_secs(5);
         loop {
@@ -330,7 +348,7 @@ struct Stats {
 
 /// Decoder that, after an error, drops P-frames until a keyframe arrives and
 /// rate-limits keyframe requests (no request storms on a lossy link).
-struct GatedDecoder {
+pub(crate) struct GatedDecoder {
     dec: fd_codec::VideoDecoder,
     need_keyframe: bool,
     last_request: Option<Instant>,
@@ -339,11 +357,11 @@ struct GatedDecoder {
 const MAX_DIM: u32 = 8192;
 
 impl GatedDecoder {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self { dec: fd_codec::VideoDecoder::new()?, need_keyframe: false, last_request: None })
     }
 
-    fn decode(&mut self, data: &[u8], keyframe: bool, tx: &Sender<ViewerMsg>) -> Option<fd_codec::DecodedFrame> {
+    pub(crate) fn decode(&mut self, data: &[u8], keyframe: bool, tx: &Sender<ViewerMsg>) -> Option<fd_codec::DecodedFrame> {
         if self.need_keyframe && !keyframe {
             self.request(tx);
             return None;

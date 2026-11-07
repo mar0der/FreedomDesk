@@ -935,7 +935,7 @@ fn audit(shared: &Shared, peer: &SocketAddr, name: &str, fp: &str, outcome: &str
     write_audit(&shared.audit_path, &line);
 }
 
-fn write_audit(path: &Path, line: &str) {
+pub(crate) fn write_audit(path: &Path, line: &str) {
     if path.as_os_str() == "-" {
         log::info!(target: "audit", "{}", line.trim_end());
         return;
@@ -955,7 +955,7 @@ fn write_audit(path: &Path, line: &str) {
     }
 }
 
-fn unix_time() -> u64 {
+pub(crate) fn unix_time() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
