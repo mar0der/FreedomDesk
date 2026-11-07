@@ -6,15 +6,22 @@
 #
 #   sudo scripts/h1-apply.sh --binary target/release/freedomdesk \
 #        [--edid-connector DP-6] [--identity ~petar/.config/freedomdesk/identity.key] \
-#        [--authorized ~petar/.config/freedomdesk/authorized_viewers] [--no-gdm] [--no-start]
+#        [--authorized ~petar/.config/freedomdesk/authorized_viewers] [--no-gdm] [--no-start] \
+#        [--headless-unthrottle]
 #
 # --edid-connector: pin the CURRENT monitor's own EDID on that connector
 #   (NVIDIA ConnectedMonitor + CustomEDID), so the same mode exists with the
 #   TV off or unplugged. Same EDID = no change while the TV is connected.
+#   Also turns off NVIDIA's headless frame limiter (see below).
+# --headless-unthrottle: ONLY set NVIDIA "LimitFrameRateWhenHeadless" "false".
+#   Without it, NVIDIA (>= 580) throttles GL/Vulkan clients - the GNOME
+#   compositor too - to 1 fps whenever no monitor is lit, so a remote view
+#   runs at ~1 fps while the TV is off. Leaves modes/EDID alone: a connected
+#   TV keeps its own picture and resolution (the20th).
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
 
-binary="" connector="" identity="" authorized="" do_gdm=1 do_start=1
+binary="" connector="" identity="" authorized="" do_gdm=1 do_start=1 unthrottle=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --binary) binary=$2; shift 2;;
@@ -23,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --authorized) authorized=$2; shift 2;;
     --no-gdm) do_gdm=0; shift;;
     --no-start) do_start=0; shift;;
+    --headless-unthrottle) unthrottle=1; shift;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac
 done
@@ -60,7 +68,33 @@ if [[ $do_gdm == 1 ]]; then
   fi
 fi
 
-# 2. NVIDIA: keep the connector "connected" with the current monitor's EDID.
+# 2. NVIDIA: keep the connector "connected" with the current monitor's EDID,
+#    and/or lift the 1 fps headless limit.
+nvidia_busid() {  # 00000000:21:00.0 -> PCI:33:0:0
+  local busid b bus rest dev fn
+  busid=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader | head -1)
+  b=${busid#*:}; bus=$((16#${b%%:*})); rest=${b#*:}; dev=$((16#${rest%%.*})); fn=${rest##*.}
+  echo "PCI:$bus:$dev:$fn"
+}
+if [[ -z $connector && $unthrottle == 1 ]]; then
+  conf=/etc/X11/xorg.conf.d/20-freedomdesk-nvidia.conf
+  pci=$(nvidia_busid)
+  track "$conf"
+  mkdir -p /etc/X11/xorg.conf.d
+  cat > "$conf" <<CONF
+# FreedomDesk H1 ($stamp): no 1 fps limit while no monitor is lit.
+# Modes/EDID untouched: a connected TV keeps its own picture and resolution.
+# Undo: scripts/h1-undo.sh (backup in $bk)
+Section "Device"
+    Identifier "FreedomDesk-NVIDIA"
+    Driver     "nvidia"
+    BusID      "$pci"
+    Option     "AllowEmptyInitialConfiguration" "true"
+    Option     "LimitFrameRateWhenHeadless" "false"
+EndSection
+CONF
+  say "NVIDIA: $conf (headless frame limit off) — takes effect after X restarts"
+fi
 if [[ -n $connector ]]; then
   disp=$(loginctl show-session "$(loginctl show-seat seat0 -p ActiveSession --value)" -p Name --value)
   xauth=$(ls /run/user/*/gdm/Xauthority 2>/dev/null | head -1)
@@ -85,6 +119,7 @@ Section "Device"
     BusID      "PCI:$bus:$dev:$fn"
     Option     "ConnectedMonitor" "$connector"
     Option     "CustomEDID" "$connector:$edid"
+    Option     "LimitFrameRateWhenHeadless" "false"
 EndSection
 CONF
   say "NVIDIA: $conf + $edid ($(( ${#hex} / 2 )) bytes) — takes effect after X restarts"
