@@ -1,13 +1,12 @@
 # STATUS — FreedomDesk PO (the21th)
 
-_Last updated: 2026-11-07 ~11:50 Dubai (PO `freedomdesk-po`)_
+_Last updated: 2026-11-07 ~12:00 Dubai (PO `freedomdesk-po`)_
 
 ## Now
 - **GUI launcher shipped** (Petar 2026-11-07 "no terminal"): `freedomdesk` with no args / **FreedomDesk.app** (macOS aarch64, CI artifact, ad-hoc signed) opens a machine list (add/edit/remove, quick connect), first-connect fingerprint check, session in the same window, Disconnect → back. Reviewed by a sub-agent; 9 findings fixed.
-- **H1 applied on the21th** (Petar approved 07:35): `freedomdesk.service` (root supervisor → host runs as the console session's uid; identity on a pipe; audit → journald) is **live** on 100.116.143.66:47801, same FP `L4O7-…-VZWO`. Verified now: T2 from the20th, lock screen wakes + is captured + takes input remotely.
-  - Pending a **reboot of the21th** (Guardian to schedule — it kills tmux sessions): GDM Xorg greeter + NVIDIA EDID pin take effect then. Then verify greeter/lock after reboot, then the20th.
-  - Backup + undo: `/var/backups/freedomdesk-h1/latest`, `sudo scripts/h1-undo.sh`.
-- **Petar's 09:44 GUI test: ~1 fps, clicks "dead"** → cause: the21th's TV went to standby ~08:30, no NVIDIA output lit → GNOME repaints ~1×/s (host sent every change). Not the GUI. Fix = H1 EDID pin (applied, needs GDM restart/reboot; blocked by FreedomOffice tests). Commit 73b525a: dark-display warning, per-session stats (fps/kbps/input), adaptive quality on slow links, SetView debounce.
+- **H1 on the21th: done + verified** (GDM restarted by Guardian 11:05, no reboot). Xorg greeter, desktop 1920×1080@60 via the TV's own 1080p EDID pin + NVIDIA `LimitFrameRateWhenHeadless=false` (Guardian's extension; backup ~/Developer/_po/backup-virtualdisplay-20261107-110154). Verified 11:50: 30 changes/s with TV off; service follows console (desktop → greeter → desktop); greeter + lock screen captured and take remote input. Login/unlock with a password from the viewer: Petar to try (no password here). Petar's Mac session 11:32: 1155 input events, 0 failed.
+- **H1 on the20th: applied 11:53, GDM restart pending (Guardian)**: WaylandEnable=false, `--headless-unthrottle` (limiter off only, no EDID/mode change: TV keeps its picture), service live on 100.115.64.43:47801, host FP `JSKM-BJCM-CFU6-SOGX-HS7J-PH6U`, authorised: Mac + the21th. Backup /var/backups/freedomdesk-h1/20261107-115305; scripts in the20th:~/freedomdesk-h1.
+- Petar's 09:44 1 fps test: cause = NVIDIA headless 1 fps limiter (TV in standby) → fixed on the21th by H1 (above). 73b525a/6cdf075: dark-display warning, per-session stats, adaptive quality, SetView debounce.
 - **v0.1.0-alpha.2 published** (pre-release, Petar OK 11:36): tag → 6cdf075, .app zip + CLI tarballs + sha256. Notes via `.github/release-notes/<tag>.md` (workflow `release-notes.yml`).
 - Mac swap to the v2/GUI build: Guardian.
 
@@ -16,7 +15,7 @@ _Last updated: 2026-11-07 ~11:50 Dubai (PO `freedomdesk-po`)_
 |---|------|-------|
 | M0–M3 | P0 capture→encode→viewer, crypto, consent, DoS limits | ✅ |
 | GUI | Launcher + saved machines + macOS .app | ✅ CI; Petar test 20 Nov |
-| **H1** | Xorg greeter, no-monitor EDID, root service | 🔶 the21th applied (reboot pending) → the20th |
+| **H1** | Xorg greeter, no-monitor EDID, root service | ✅ the21th · 🔶 the20th (GDM restart pending) |
 | H2–H6 | Session follow w/o reconnect, scoped perms, agent MCP, Wayland, macOS headless | ⏳ SPEC §16 |
 | M4 | Join code + autostart (service now covers autostart) | ⏳ |
 | I1 / A1–A2 | iPhone viewer, controlling agents (plan only) | 📝 SPEC §17 |
@@ -30,11 +29,11 @@ _Last updated: 2026-11-07 ~11:50 Dubai (PO `freedomdesk-po`)_
 - OpenH264 from source. ⚠ patent cover only for Cisco's binary — decide before packaging.
 
 ## Blocked / needs Petar or Guardian
-1. Guardian: schedule a the21th reboot or GDM restart (outbox 20261107-0800). Until then the21th streams ~1 fps whenever its TV is off.
-2. the20th H1 after the21th verifies; its GDM restart via Guardian.
+1. Guardian: schedule a GDM restart on the20th (outbox 20261107-1200). Then I verify.
+2. Petar: physical TV check on the21th (1080p shows), and a password login/unlock from the viewer.
 
 ## Known gaps
-- the20th has no lit output either (TV off, headless metamode): as a host it would also be ~1 fps until a monitor/EDID is pinned.
+- the20th streams ~1 fps while its TV is off until its GDM restart (limiter off then).
 - Session change (greeter ↔ desktop) drops the viewer; reconnect by hand until H2 (auto-reconnect).
 - Windows AltGr / macOS Option characters not forwarded; consent dialog not killed if the viewer leaves.
 - .app is not notarised: first launch needs `xattr -dr com.apple.quarantine` or "Open Anyway".
