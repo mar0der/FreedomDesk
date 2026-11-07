@@ -137,6 +137,13 @@ pub trait Capturer: Send {
     fn cursor(&mut self) -> anyhow::Result<Option<CursorInfo>> {
         Ok(None)
     }
+
+    /// Number of display outputs currently showing a picture (lit CRTCs), if known.
+    /// `Some(0)` means no monitor is driven: GPU compositors (NVIDIA + GNOME) then
+    /// repaint only about once a second, so streams drop to ~1 fps.
+    fn active_outputs(&mut self) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(test)]

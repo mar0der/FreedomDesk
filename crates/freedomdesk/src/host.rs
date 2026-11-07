@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -300,8 +300,90 @@ impl ViewReq {
     const FULL: ViewReq = ViewReq { x: 0, y: 0, w: NORM_MAX, h: NORM_MAX, max_w: u32::MAX, max_h: u32::MAX };
 }
 
-/// (crop size, output bounds) an encoder was built for.
-type EncKey = ((u32, u32), (u32, u32));
+/// (crop size, output bounds, bitrate) an encoder was built for.
+type EncKey = ((u32, u32), (u32, u32), u32);
+
+/// Per-session counters shared by the session threads (for the periodic stats log).
+#[derive(Default)]
+struct Counters {
+    inputs: AtomicU64,
+    input_failed: AtomicU64,
+    input_ignored: AtomicU64,
+    views: AtomicU64,
+    keyframe_requests: AtomicU64,
+}
+
+/// Quality ladder for slow / relayed links: (bitrate factor, output size factor).
+/// Lower quality, never a frozen picture.
+const QUALITY_LEVELS: [(f32, f32); 6] = [(1.0, 1.0), (0.6, 1.0), (0.4, 0.8), (0.25, 0.67), (0.15, 0.5), (0.08, 0.4)];
+const MIN_BITRATE_BPS: u32 = 250_000;
+/// Unsent data (in seconds of video at the current bitrate) that counts as congestion …
+const CONGESTED_S: f64 = 0.15;
+/// … for this long before we step down a level.
+const CONGESTED_FOR: Duration = Duration::from_millis(500);
+/// Below this the link keeps up; after `CALM_FOR` with frames flowing we step up.
+const CALM_S: f64 = 0.03;
+const CALM_FOR: Duration = Duration::from_secs(6);
+/// Above this much unsent video, hold new frames (newest one is sent once it drains).
+const GATE_S: f64 = 0.3;
+const STATS_EVERY: Duration = Duration::from_secs(10);
+
+/// Adaptive quality from the kernel send queue (no viewer cooperation needed).
+struct Adapt {
+    level: usize,
+    changed: Instant,
+    over_since: Option<Instant>,
+    /// (since, frames sent at that point)
+    calm_since: Option<(Instant, u64)>,
+}
+
+impl Adapt {
+    fn new() -> Self {
+        Self { level: 0, changed: Instant::now(), over_since: None, calm_since: None }
+    }
+
+    fn bitrate(&self, base: u32) -> u32 {
+        ((base as f64 * QUALITY_LEVELS[self.level].0 as f64) as u32).max(MIN_BITRATE_BPS.min(base))
+    }
+
+    fn scale_permille(&self) -> u32 {
+        (QUALITY_LEVELS[self.level].1 * 1000.0).round() as u32
+    }
+
+    /// Feed one queue-delay sample; returns true if the level changed.
+    fn update(&mut self, delay_s: f64, frames_sent: u64, now: Instant) -> bool {
+        if delay_s > CONGESTED_S {
+            self.calm_since = None;
+            let since = *self.over_since.get_or_insert(now);
+            if self.level + 1 < QUALITY_LEVELS.len()
+                && now.duration_since(since) >= CONGESTED_FOR
+                && now.duration_since(self.changed) >= Duration::from_secs(1)
+            {
+                self.level += 1;
+                self.changed = now;
+                self.over_since = None;
+                return true;
+            }
+        } else if delay_s < CALM_S {
+            self.over_since = None;
+            let (since, f0) = *self.calm_since.get_or_insert((now, frames_sent));
+            if self.level > 0
+                && now.duration_since(since) >= CALM_FOR
+                && frames_sent.saturating_sub(f0) >= 30
+                && now.duration_since(self.changed) >= CALM_FOR
+            {
+                self.level -= 1;
+                self.changed = now;
+                self.calm_since = None;
+                return true;
+            }
+        } else {
+            self.over_since = None;
+            self.calm_since = None;
+        }
+        false
+    }
+}
 
 fn pack(w: u32, h: u32) -> u64 {
     ((w as u64) << 32) | h as u64
@@ -324,9 +406,11 @@ fn crop_rect(r: ViewReq, sw: u32, sh: u32) -> Rect {
 }
 
 /// Encoder output bounds: the host's cap, reduced to what the viewer can show.
-fn out_bounds(args: &HostArgs, r: ViewReq) -> (u32, u32) {
-    let w = even_down(args.max_width.min(r.max_w).max(64));
-    let h = even_down(args.max_height.min(r.max_h).max(64));
+/// `scale_permille` < 1000 shrinks them further (adaptive quality).
+fn out_bounds(args: &HostArgs, r: ViewReq, scale_permille: u32) -> (u32, u32) {
+    let s = |v: u32| (v as u64 * scale_permille.min(1000) as u64 / 1000) as u32;
+    let w = even_down(s(args.max_width.min(r.max_w)).max(64));
+    let h = even_down(s(args.max_height.min(r.max_h)).max(64));
     (w, h)
 }
 
@@ -380,6 +464,9 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
     let force_capture = Arc::new(AtomicBool::new(true));
     let screen_size = Arc::new(std::sync::atomic::AtomicU64::new(pack(sw, sh)));
     let view_req = Arc::new(Mutex::new(ViewReq::FULL));
+    let counters = Arc::new(Counters::default());
+    let quality_scale = Arc::new(AtomicU32::new(1000));
+    let started = Instant::now();
 
     // Input / control thread.
     let input_thread = {
@@ -389,6 +476,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         let screen_size = screen_size.clone();
         let view_req = view_req.clone();
         let writer = writer.clone();
+        let counters = counters.clone();
         let mut injector = injector;
         std::thread::Builder::new().name("host-input".into()).spawn(move || {
             let mut size = pack(sw, sh);
@@ -397,6 +485,10 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                     let bytes = reader.recv()?;
                     match fd_proto::decode::<ViewerMsg>(&bytes)? {
                         ViewerMsg::Input(ev) => {
+                            counters.inputs.fetch_add(1, Ordering::Relaxed);
+                            if injector.is_none() {
+                                counters.input_ignored.fetch_add(1, Ordering::Relaxed);
+                            }
                             if let Some(inj) = injector.as_mut() {
                                 let now = screen_size.load(Ordering::Relaxed);
                                 if now != size {
@@ -404,6 +496,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                                     inj.set_screen_size((now >> 32) as u32, now as u32);
                                 }
                                 if let Err(e) = inj.inject(&ev) {
+                                    counters.input_failed.fetch_add(1, Ordering::Relaxed);
                                     log::warn!("inject {ev:?}: {e:#}");
                                 }
                             }
@@ -419,11 +512,15 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                             };
                             let mut g = view_req.lock().map_err(|_| anyhow!("view poisoned"))?;
                             if *g != req {
+                                counters.views.fetch_add(1, Ordering::Relaxed);
                                 *g = req;
                                 force_capture.store(true, Ordering::Relaxed);
                             }
                         }
-                        ViewerMsg::RequestKeyframe => want_keyframe.store(true, Ordering::Relaxed),
+                        ViewerMsg::RequestKeyframe => {
+                            counters.keyframe_requests.fetch_add(1, Ordering::Relaxed);
+                            want_keyframe.store(true, Ordering::Relaxed)
+                        }
                         ViewerMsg::Ping { ts_us } => {
                             let b = fd_proto::encode(&HostMsg::Pong { ts_us })?;
                             writer.lock().map_err(|_| anyhow!("writer poisoned"))?.send(&b)?;
@@ -453,6 +550,8 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         let writer = writer.clone();
         let base_cfg = base_cfg.clone();
         let args = args.clone();
+        let quality_scale = quality_scale.clone();
+        let viewer_name = viewer_name.to_string();
         let interval = Duration::from_secs_f32(1.0 / base_cfg.fps);
         std::thread::Builder::new().name("host-capture".into()).spawn(move || {
             let result = (|| -> Result<()> {
@@ -463,8 +562,26 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                 let mut last_cursor: Option<(i32, i32, bool)> = None;
                 let mut req = ViewReq::FULL;
                 let mut last_adopt = Instant::now() - Duration::from_secs(1);
+                let mut last_display_check: Option<Instant> = None;
+                let mut display_dark = false;
                 while !stop.load(Ordering::SeqCst) {
                     let tick = Instant::now();
+
+                    // No lit monitor → the compositor repaints ~1×/s: say so in the log.
+                    if last_display_check.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
+                        last_display_check = Some(tick);
+                        let dark = capturer.active_outputs() == Some(0);
+                        if dark && !display_dark {
+                            log::warn!(
+                                "session with {viewer_name}: no display output is active (monitor off or unplugged). \
+                                 The desktop then repaints only ~1×/s, so video will be ~1 fps. \
+                                 Fix: turn the monitor on, or pin a monitor (H1: scripts/h1-apply.sh --edid-connector, then restart GDM)"
+                            );
+                        } else if !dark && display_dark {
+                            log::info!("session with {viewer_name}: a display output is active again");
+                        }
+                        display_dark = dark;
+                    }
 
                     // Cursor channel: shape on change, position on change.
                     let cursor = if args.cursor_in_video {
@@ -503,7 +620,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                         force_capture.store(true, Ordering::Relaxed); // new region: grab even if static
                     }
                     let crop = crop_rect(req, sw, sh);
-                    let max = out_bounds(&args, req);
+                    let max = out_bounds(&args, req, quality_scale.load(Ordering::Relaxed));
                     let key = ((crop.w, crop.h), max);
                     if converter.is_none() || conv_key != key {
                         let cfg = fd_codec::EncoderConfig { max_width: max.0, max_height: max.1, ..base_cfg.clone() };
@@ -576,7 +693,14 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
     let mut seq = 0u64;
     let mut encoder: Option<(fd_codec::VideoEncoder, EncKey)> = None;
     let mut last: Option<Pic> = None;
+    let mut pending = false;
     let mut kf_retries = 0u32;
+    let mut adapt = Adapt::new();
+    let mut total_bytes = 0u64;
+    let mut held = 0u64;
+    let mut max_queue = 0usize;
+    // (when, frames, bytes, inputs, held) at the last stats line.
+    let mut mark = (Instant::now(), 0u64, 0u64, 0u64, 0u64);
     let video_result = (|| -> Result<()> {
         loop {
             if stop.load(Ordering::SeqCst) || shared.shutting_down.load(Ordering::SeqCst) {
@@ -593,13 +717,55 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                 }
                 g.pic.take()
             };
+            let now = Instant::now();
+            let queued = shutdown.queued_bytes();
+            let bps = adapt.bitrate(base_cfg.bitrate_bps);
+            let delay = queued.map_or(0.0, |q| q as f64 * 8.0 / bps as f64);
+            max_queue = max_queue.max(queued.unwrap_or(0));
+            if adapt.update(delay, seq, now) {
+                quality_scale.store(adapt.scale_permille(), Ordering::Relaxed);
+                log::info!(
+                    "session with {viewer_name}: quality level {} ({} kbps, {}% size); send queue {:.0} ms",
+                    adapt.level,
+                    adapt.bitrate(base_cfg.bitrate_bps) / 1000,
+                    adapt.scale_permille() / 10,
+                    delay * 1000.0
+                );
+            }
+            if now.duration_since(mark.0) >= STATS_EVERY {
+                let secs = now.duration_since(mark.0).as_secs_f64();
+                let inputs = counters.inputs.load(Ordering::Relaxed);
+                log::info!(
+                    "session with {viewer_name}: {:.1} fps, {:.0} kbps, quality {}, queue max {} KB, held {}, input {} (+{})",
+                    (seq - mark.1) as f64 / secs,
+                    (total_bytes - mark.2) as f64 * 8.0 / 1000.0 / secs,
+                    adapt.level,
+                    max_queue / 1024,
+                    held - mark.4,
+                    inputs,
+                    inputs - mark.3,
+                );
+                mark = (now, seq, total_bytes, inputs, held);
+                max_queue = 0;
+            }
+
             let kf = want_keyframe.swap(false, Ordering::Relaxed);
             if let Some(p) = fresh {
                 if let Some(old) = last.replace(p) {
                     let _ = recycle_tx.send(old.pic);
                 }
-            } else if !kf {
+                pending = true;
+            }
+            if !pending && !kf {
                 continue; // nothing new on screen
+            }
+            // Link can't keep up: hold the newest picture until the queue drains.
+            if delay > GATE_S {
+                held += 1;
+                if kf {
+                    want_keyframe.store(true, Ordering::Relaxed);
+                }
+                continue;
             }
             let Some(pic) = last.as_ref() else {
                 // Keyframe wanted before anything was captured: ask for a full grab.
@@ -607,9 +773,10 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                 force_capture.store(true, Ordering::Relaxed);
                 continue;
             };
-            let key = (pic.src, pic.max);
+            pending = false;
+            let key = (pic.src, pic.max, bps);
             if encoder.as_ref().is_none_or(|(_, k)| *k != key) {
-                let cfg = fd_codec::EncoderConfig { max_width: pic.max.0, max_height: pic.max.1, ..base_cfg.clone() };
+                let cfg = fd_codec::EncoderConfig { max_width: pic.max.0, max_height: pic.max.1, bitrate_bps: bps, ..base_cfg.clone() };
                 encoder = Some((fd_codec::VideoEncoder::new(pic.src.0, pic.src.1, cfg)?, key));
             }
             let (enc, _) = encoder.as_mut().expect("encoder just set");
@@ -617,6 +784,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                 Some(out) => {
                     kf_retries = 0;
                     seq += 1;
+                    total_bytes += out.data.len() as u64;
                     send_on(&writer, &HostMsg::Video {
                         seq,
                         keyframe: out.keyframe,
@@ -647,7 +815,19 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         *g = None;
     }
     let input_result = input_thread.join().map_err(|_| anyhow!("input thread panicked"))?;
-    log::info!("session with {viewer_name} ended after {seq} frames");
+    let secs = started.elapsed().as_secs_f64().max(0.001);
+    log::info!(
+        "session with {viewer_name} ended after {seq} frames in {secs:.0} s ({:.1} fps avg, {:.0} kbps avg); \
+         input events {} ({} failed, {} ignored: view-only), view changes {}, keyframe requests {}, frames held for a slow link {held}, final quality level {}",
+        seq as f64 / secs,
+        total_bytes as f64 * 8.0 / 1000.0 / secs,
+        counters.inputs.load(Ordering::Relaxed),
+        counters.input_failed.load(Ordering::Relaxed),
+        counters.input_ignored.load(Ordering::Relaxed),
+        counters.views.load(Ordering::Relaxed),
+        counters.keyframe_requests.load(Ordering::Relaxed),
+        adapt.level,
+    );
     // A viewer hanging up shows up as a read error on the input thread; that's a normal end.
     match (video_result, input_result) {
         (Err(e), _) if !is_disconnect(&e) => Err(e),
@@ -737,5 +917,51 @@ mod tests {
         let half = ViewReq { x: 16384, y: 16384, w: 32768, h: 32768, max_w: 1, max_h: 1 };
         let c = crop_rect(half, 3841, 2161);
         assert!(c.x + c.w <= 3841 && c.y + c.h <= 2161);
+    }
+
+    #[test]
+    fn adapt_steps_down_under_congestion_and_back_up_when_calm() {
+        let t = Instant::now() + Duration::from_secs(10);
+        let mut a = Adapt::new();
+        assert_eq!(a.bitrate(6_000_000), 6_000_000);
+        // A short spike (one IDR) does not change anything.
+        assert!(!a.update(0.5, 0, t));
+        assert!(!a.update(0.0, 0, t + Duration::from_millis(100)));
+        // Sustained congestion: one level per second at most.
+        assert!(!a.update(0.5, 0, t + Duration::from_millis(200)));
+        assert!(a.update(0.5, 0, t + Duration::from_millis(800)));
+        assert_eq!(a.level, 1);
+        assert!(!a.update(0.5, 0, t + Duration::from_millis(1400)));
+        assert!(a.update(0.5, 0, t + Duration::from_millis(1900)));
+        assert_eq!(a.level, 2);
+        assert!(a.scale_permille() < 1000 && a.bitrate(6_000_000) < 6_000_000);
+        // Floors: never below the minimum bitrate / last level.
+        let mut now = t + Duration::from_secs(3);
+        for _ in 0..40 {
+            now += Duration::from_millis(600);
+            a.update(1.0, 0, now);
+        }
+        assert_eq!(a.level, QUALITY_LEVELS.len() - 1);
+        assert!(a.bitrate(6_000_000) >= MIN_BITRATE_BPS);
+        // Calm but idle (no frames sent): stay; calm with frames flowing: step up.
+        assert!(!a.update(0.0, 100, now + Duration::from_secs(1)));
+        assert!(!a.update(0.0, 100, now + Duration::from_secs(8)));
+        assert!(!a.update(0.0, 120, now + Duration::from_secs(9)));
+        assert!(a.update(0.0, 140, now + Duration::from_secs(10)));
+        assert_eq!(a.level, QUALITY_LEVELS.len() - 2);
+    }
+
+    #[test]
+    fn out_bounds_scale() {
+        let full = ViewReq::FULL;
+        #[derive(clap::Parser)]
+        struct W {
+            #[command(flatten)]
+            a: HostArgs,
+        }
+        let args = <W as clap::Parser>::parse_from(["host"]).a;
+        assert_eq!(out_bounds(&args, full, 1000), (1920, 1080));
+        assert_eq!(out_bounds(&args, full, 500), (960, 540));
+        assert_eq!(out_bounds(&args, full, 1), (64, 64));
     }
 }

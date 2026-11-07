@@ -592,6 +592,10 @@ impl ViewXf {
 const EDGE_PAN_ZONE: f32 = 28.0;
 const EDGE_PAN_SPEED: f32 = 1200.0; // points per second at the very edge
 const VIEW_SEND_INTERVAL: Duration = Duration::from_millis(150);
+const VIEW_SETTLE: Duration = Duration::from_millis(250);
+
+/// SetView request: normalised x, y, w, h + physical max width/height.
+type ViewKey = (u16, u16, u16, u16, u32, u32);
 
 pub struct ViewerApp {
     tx: Sender<ViewerMsg>,
@@ -606,8 +610,10 @@ pub struct ViewerApp {
     center: egui::Pos2,
     xf: ViewXf,
     toolbar_rect: egui::Rect,
-    last_view_sent: Option<(u16, u16, u16, u16, u32, u32)>,
+    last_view_sent: Option<ViewKey>,
     last_view_time: Instant,
+    /// View we would like (and since when), see `update_view_request`.
+    view_candidate: Option<(ViewKey, Instant)>,
     pending_move: Option<(u16, u16)>,
     last_pos: Option<(u16, u16)>,
     mods: Mods,
@@ -744,7 +750,13 @@ impl ViewerApp {
         let n = |v: f32, full: f32| ((v / full).clamp(0.0, 1.0) * NORM_MAX as f32).round() as u16;
         let phys = |px: f32| (((px * self.xf.scale * ppp) / 16.0).round() as u32 * 16).clamp(64, 3840);
         let want = (n(x0, s.x), n(y0, s.y), n(x1 - x0, s.x), n(y1 - y0, s.y), phys(x1 - x0), phys(y1 - y0).min(2160));
-        if self.last_view_sent != Some(want) && self.last_view_time.elapsed() >= VIEW_SEND_INTERVAL && self.ended.is_none() {
+        // Debounce: only a view that held still for VIEW_SETTLE is sent. Every new size makes the
+        // host rebuild its encoder (a keyframe), so window drags / zoom steps must not spam it.
+        if self.view_candidate.is_none_or(|(v, _)| v != want) {
+            self.view_candidate = Some((want, Instant::now()));
+        }
+        let settled = self.view_candidate.is_some_and(|(_, t)| t.elapsed() >= VIEW_SETTLE);
+        if self.last_view_sent != Some(want) && settled && self.last_view_time.elapsed() >= VIEW_SEND_INTERVAL && self.ended.is_none() {
             self.last_view_sent = Some(want);
             self.last_view_time = Instant::now();
             let _ = self.tx.send(ViewerMsg::SetView {
@@ -1067,6 +1079,7 @@ impl ViewerApp {
             toolbar_rect: egui::Rect::NOTHING,
             last_view_sent: None,
             last_view_time: Instant::now() - VIEW_SEND_INTERVAL,
+            view_candidate: None,
             pending_move: None,
             last_pos: None,
             mods: Mods::default(),
@@ -1131,7 +1144,8 @@ impl ViewerApp {
         if panning {
             ctx.request_repaint();
         } else {
-            ctx.request_repaint_after(if self.last_view_sent.is_some() { Duration::from_millis(200) } else { Duration::from_millis(50) });
+            let view_pending = self.view_candidate.is_some_and(|(v, _)| self.last_view_sent != Some(v));
+            ctx.request_repaint_after(if view_pending { Duration::from_millis(50) } else { Duration::from_millis(200) });
         }
         self.leave
     }

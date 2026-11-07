@@ -1019,6 +1019,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "data-encoding",
+ "libc",
  "log",
  "sha2",
  "snow",

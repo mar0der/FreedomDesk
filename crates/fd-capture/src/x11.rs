@@ -599,6 +599,20 @@ impl Capturer for X11Capturer {
         }))
     }
 
+    fn active_outputs(&mut self) -> Option<u32> {
+        use x11rb::protocol::randr::ConnectionExt as _;
+        self.conn.extension_information(x11rb::protocol::randr::X11_EXTENSION_NAME).ok()??;
+        let res = self.conn.randr_get_screen_resources_current(self.root).ok()?.reply().ok()?;
+        let mut lit = 0;
+        for crtc in res.crtcs {
+            let info = self.conn.randr_get_crtc_info(crtc, res.config_timestamp).ok()?.reply().ok()?;
+            if info.mode != NONE && !info.outputs.is_empty() {
+                lit += 1;
+            }
+        }
+        Some(lit)
+    }
+
     fn set_draw_cursor(&mut self, on: bool) {
         if on != self.draw_cursor {
             self.draw_cursor = on;

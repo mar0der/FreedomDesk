@@ -312,6 +312,24 @@ impl ShutdownHandle {
     pub fn shutdown(&self) {
         let _ = self.0.shutdown(std::net::Shutdown::Both);
     }
+
+    /// Bytes queued in the kernel that TCP has not sent yet (the link is slower
+    /// than we write), for congestion control. `None` where unsupported.
+    pub fn queued_bytes(&self) -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SIOCOUTQNSD: bytes not yet sent (excludes data in flight, so RTT doesn't count).
+            const SIOCOUTQNSD: u64 = 0x894B;
+            let mut n: libc::c_int = 0;
+            let rc = unsafe { libc::ioctl(self.0.as_raw_fd(), SIOCOUTQNSD as _, &mut n) };
+            (rc == 0 && n >= 0).then_some(n as usize)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
 }
 
 impl SecureReader {

@@ -28,7 +28,7 @@ data-encoding = "2"
 zeroize = "1"
 directories = "6"
 clap = { version = "4", features = ["derive"] }
-x11rb = { version = "0.13", features = ["shm", "xtest", "xkb", "damage", "xfixes"] }
+x11rb = { version = "0.13", features = ["shm", "xtest", "xkb", "damage", "xfixes", "randr"] }
 libc = "0.2"
 ctrlc = { version = "3", features = ["termination"] }
 openh264 = "0.9"
