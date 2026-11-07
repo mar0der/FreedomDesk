@@ -935,21 +935,44 @@ fn audit(shared: &Shared, peer: &SocketAddr, name: &str, fp: &str, outcome: &str
     write_audit(&shared.audit_path, &line);
 }
 
+/// Stop appending to the audit log past this size (one marker line is written instead).
+const AUDIT_CAP: u64 = 10 * 1024 * 1024;
+const AUDIT_FULL_MARKER: &str = "audit log full: further entries are not recorded (rotate or remove this file)\n";
+
 pub(crate) fn write_audit(path: &Path, line: &str) {
+    write_audit_capped(path, line, AUDIT_CAP);
+}
+
+fn write_audit_capped(path: &Path, line: &str, cap: u64) {
     if path.as_os_str() == "-" {
         log::info!(target: "audit", "{}", line.trim_end());
         return;
     }
     let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
+    opts.create(true).append(true).read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let r = opts
-        .open(path)
-        .and_then(|mut f| f.write_all(line.as_bytes()));
+    let r = opts.open(path).and_then(|mut f| {
+        let len = f.metadata()?.len();
+        if len >= cap {
+            // Full: write the marker once, then nothing.
+            let tail_from = len.saturating_sub(AUDIT_FULL_MARKER.len() as u64 + 8);
+            let mut tail = Vec::new();
+            {
+                use std::io::{Read, Seek, SeekFrom};
+                f.seek(SeekFrom::Start(tail_from))?;
+                f.read_to_end(&mut tail)?;
+            }
+            if !String::from_utf8_lossy(&tail).contains("audit log full") {
+                f.write_all(AUDIT_FULL_MARKER.as_bytes())?;
+            }
+            return Ok(());
+        }
+        f.write_all(line.as_bytes())
+    });
     if let Err(e) = r {
         log::warn!("audit log {}: {e}", path.display());
     }
@@ -1026,6 +1049,20 @@ mod tests {
         assert!(!a.update(0.0, 120, now + Duration::from_secs(9)));
         assert!(a.update(0.0, 140, now + Duration::from_secs(10)));
         assert_eq!(a.level, QUALITY_LEVELS.len() - 2);
+    }
+
+    #[test]
+    fn audit_log_stops_at_the_cap_with_one_marker() {
+        let p = std::env::temp_dir().join(format!("fd-audit-cap-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        for i in 0..20 {
+            write_audit_capped(&p, &format!("line {i:02} xxxxxxxxxx\n"), 100);
+        }
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.matches("audit log full").count(), 1, "{text}");
+        assert!(text.contains("line 00") && !text.contains("line 19"), "{text}");
+        assert!(text.len() < 100 + 20 + AUDIT_FULL_MARKER.len());
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

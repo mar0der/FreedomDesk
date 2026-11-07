@@ -101,18 +101,31 @@ pub fn run(dir: &Path, args: AgentArgs) -> i32 {
         AgentCmd::Status { host } => Ok(Action::Status { host }),
     };
     let result = action.and_then(|a| {
-        if a.is_input() {
+        // Opt-in: the CLI obeys agent.toml too (FREEDOMDESK_AGENT_MCP_ONLY or cli_requires_policy).
+        let policy = if cli_policy_enabled(dir)? { Some(crate::mcp::AgentConfig::load(dir)?) } else { None };
+        if let Some(cfg) = &policy {
+            if let Err(why) = crate::mcp::authorize(cfg, kill_switch(dir).as_deref(), &a) {
+                audit(dir, "cli", &a, "outcome=denied reason=policy");
+                bail!("{why}");
+            }
+            if !rate_check_file(dir, cfg.rate_limit_per_minute) {
+                audit(dir, "cli", &a, "outcome=rate_limited");
+                bail!("rate limit exceeded ({} calls per minute); wait and retry", cfg.rate_limit_per_minute);
+            }
+        } else if a.is_input() {
             if let Some(why) = kill_switch(dir) {
-                audit(dir, "cli", &a, &format!("outcome=denied reason=\"{why}\""));
+                audit(dir, "cli", &a, "outcome=denied reason=killed");
                 bail!("{why}");
             }
         }
+        let rc = crate::mcp::recheck_fn(dir);
         let t = Target {
             dir,
             expect_fp: args.expect_fingerprint.clone(),
-            allow: None,
+            allow: policy.as_ref().map(|c| c.allow_hosts.clone()),
             timeout: Duration::from_secs(args.timeout.max(1)),
             source: "cli",
+            recheck: policy.as_ref().map(|_| &rc as &Recheck),
         };
         let mut out = execute(&t, &a)?;
         // CLI screenshot: write the file / attach base64 (the MCP server returns an image instead).
@@ -139,6 +152,41 @@ pub fn run(dir: &Path, args: AgentArgs) -> i32 {
             1
         }
     }
+}
+
+/// Env var: make the CLI obey agent.toml as the MCP server does.
+pub const MCP_ONLY_NAME: &str = "FREEDOMDESK_AGENT_MCP_ONLY";
+
+fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| {
+        let v = v.to_string_lossy().trim().to_ascii_lowercase();
+        !v.is_empty() && v != "0" && v != "false"
+    })
+}
+
+/// Does the CLI have to obey agent.toml? Fails closed: an unreadable or invalid
+/// agent.toml is an error, never "no policy".
+fn cli_policy_enabled(dir: &Path) -> Result<bool> {
+    if env_flag(MCP_ONLY_NAME) {
+        return Ok(true);
+    }
+    Ok(crate::mcp::AgentConfig::load(dir).context("agent.toml must be valid (the CLI checks it for cli_requires_policy)")?.cli_requires_policy)
+}
+
+/// Rate limit shared between CLI processes: unix timestamps of recent calls in `<config>/agent.rate`.
+/// Returns false when over the limit or when the state cannot be written (fail closed).
+pub fn rate_check_file(dir: &Path, limit: u32) -> bool {
+    let p = dir.join("agent.rate");
+    let now = crate::host::unix_time();
+    let mut recent: Vec<u64> = std::fs::read_to_string(&p)
+        .map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).filter(|t: &u64| now.saturating_sub(*t) < 60).collect())
+        .unwrap_or_default();
+    if recent.len() >= limit as usize {
+        return false;
+    }
+    recent.push(now);
+    let body: String = recent.iter().map(|t| format!("{t}\n")).collect();
+    std::fs::write(&p, body).is_ok()
 }
 
 fn read_text_arg(text: String) -> Result<String> {
@@ -220,8 +268,9 @@ impl Action {
             Action::Type { text, .. } => format!("chars={}", text.chars().count()),
             Action::Key { combo, .. } => match parse_combo(combo) {
                 // A lone printable key could be one character of a password: not logged.
-                Ok(c) if c.mods.is_empty() && c.printable => "key=<printable>".into(),
-                Ok(_) => format!("combo={}", combo.replace(['"', '\n', ' '], "_")),
+                // Shift only changes case/symbol, so it does not make a key safe to log.
+                Ok(c) if c.printable && c.mods.iter().all(|m| *m == SHIFT) => "key=<printable>".into(),
+                Ok(_) => format!("combo={}", audit_clean(combo)),
                 Err(_) => "combo=<invalid>".into(),
             },
             Action::ClipboardSet { text, .. } => format!("bytes={}", text.len()),
@@ -229,6 +278,9 @@ impl Action {
         }
     }
 }
+
+/// Policy re-check callback (see `Target::recheck`).
+pub type Recheck<'a> = dyn Fn(&Action) -> std::result::Result<(), String> + 'a;
 
 /// How a call connects and what it may reach.
 pub struct Target<'a> {
@@ -239,6 +291,50 @@ pub struct Target<'a> {
     pub timeout: Duration,
     /// "cli" or "mcp", for the audit log.
     pub source: &'static str,
+    /// Policy re-check run after connecting and before every input send (the
+    /// consent wait can last minutes). `None` = only the kill switch applies.
+    pub recheck: Option<&'a Recheck<'a>>,
+}
+
+/// Refuse input if the kill switch or policy changed since the call began.
+fn guard(t: &Target, a: &Action) -> Result<()> {
+    if !a.is_input() {
+        return Ok(());
+    }
+    if let Some(why) = kill_switch(t.dir) {
+        bail!("{why}");
+    }
+    if let Some(r) = t.recheck {
+        r(a).map_err(|why| anyhow!("{why}"))?;
+    }
+    Ok(())
+}
+
+/// Coarse error class for the audit log: error texts can echo caller input (key combos, hosts).
+fn error_class(e: &anyhow::Error) -> &'static str {
+    let m = format!("{e:#}").to_ascii_lowercase();
+    let has = |ks: &[&str]| ks.iter().any(|k| m.contains(k));
+    if has(&["kill switch", "_agent_kill"]) {
+        "killed"
+    } else if has(&["input is disabled", "clipboard access is disabled", "clipboard writing is disabled", "rate limit"]) {
+        "policy"
+    } else if has(&["not pinned"]) {
+        "not_pinned"
+    } else if has(&["allowlist"]) {
+        "not_allowed"
+    } else if has(&["mismatch", "host key changed", "does not match"]) {
+        "key_mismatch"
+    } else if has(&["did not negotiate"]) {
+        "no_clipboard"
+    } else if has(&["outside the"]) {
+        "bad_coordinates"
+    } else if has(&["unknown key", "unknown modifier", "unknown button", "empty key", "control character", "longer than", "rejected", "twice", "bad picture", "refusing picture"]) {
+        "invalid_input"
+    } else if has(&["no frame", "acknowledge", "session ended", "connection", "connecting", "resolv", "timed out", "handshake", "denied", "not trusted", "waiting for host"]) {
+        "connection"
+    } else {
+        "error"
+    }
 }
 
 /// Run one action and write one audit line (success or failure).
@@ -246,7 +342,7 @@ pub fn execute(t: &Target, a: &Action) -> Result<Output> {
     let r = do_execute(t, a);
     let outcome = match &r {
         Ok(_) => "outcome=ok".to_string(),
-        Err(e) => format!("outcome=error reason=\"{}\"", format!("{e:#}").replace(['"', '\n'], "'")),
+        Err(e) => format!("outcome=error class={}", error_class(e)),
     };
     audit(t.dir, t.source, a, &outcome);
     r
@@ -284,9 +380,11 @@ fn do_execute(t: &Target, a: &Action) -> Result<Output> {
             if *x >= w || *y >= h {
                 bail!("coordinates ({x},{y}) outside the {w}x{h} screenshot area");
             }
+            guard(t, a)?;
             live.send(ViewerMsg::Input(InputEvent::MouseMove { x: norm(*x, w), y: norm(*y, h) }))?;
             std::thread::sleep(Duration::from_millis(40));
             for _ in 0..if *double { 2 } else { 1 } {
+                guard(t, a)?;
                 live.send(ViewerMsg::Input(InputEvent::MouseButton { button: *button, down: true }))?;
                 std::thread::sleep(Duration::from_millis(30));
                 live.send(ViewerMsg::Input(InputEvent::MouseButton { button: *button, down: false }))?;
@@ -305,9 +403,7 @@ fn do_execute(t: &Target, a: &Action) -> Result<Output> {
             let live = Live::connect(t, host, false)?;
             for ch in text.chars() {
                 // Re-checked per character so the kill switch stops a long paste mid-way.
-                if let Some(why) = kill_switch(t.dir) {
-                    bail!("{why} (stopped after partial input)");
-                }
+                guard(t, a).map_err(|e| anyhow!("{e:#} (stopped after partial input)"))?;
                 match ch {
                     '\n' | '\r' => live.tap(0xff0d)?,
                     '\t' => live.tap(0xff09)?,
@@ -322,10 +418,12 @@ fn do_execute(t: &Target, a: &Action) -> Result<Output> {
         Action::Key { host, combo } => {
             let c = parse_combo(combo)?;
             let live = Live::connect(t, host, false)?;
+            guard(t, a)?;
             for m in &c.mods {
                 live.send(ViewerMsg::Input(InputEvent::Key { keysym: *m, down: true }))?;
             }
             std::thread::sleep(Duration::from_millis(30));
+            guard(t, a).inspect_err(|_| release_mods(&live, &c.mods))?;
             live.tap(c.key)?;
             std::thread::sleep(Duration::from_millis(30));
             for m in c.mods.iter().rev() {
@@ -357,10 +455,17 @@ fn do_execute(t: &Target, a: &Action) -> Result<Output> {
                 bail!("host did not negotiate clipboard sync to the host (needs --clipboard on the host, and not --view-only)");
             }
             let n = clean.len();
+            guard(t, a)?;
             live.send(ViewerMsg::Clipboard { text: clean })?;
             live.sync(Duration::from_secs(5))?;
             Ok(Output { json: json!({"bytes": n}), png: None })
         }
+    }
+}
+
+fn release_mods(live: &Live, mods: &[u32]) {
+    for m in mods.iter().rev() {
+        let _ = live.send(ViewerMsg::Input(InputEvent::Key { keysym: *m, down: false }));
     }
 }
 
@@ -383,19 +488,28 @@ pub fn kill_switch(dir: &Path) -> Option<String> {
         }
     }
     let f = dir.join(KILL_NAME);
-    if f.exists() {
-        return Some(format!("kill switch file {} exists: input tools are disabled", f.display()));
+    match std::fs::symlink_metadata(&f) {
+        Ok(_) => Some(format!("kill switch file {} exists: input tools are disabled", f.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // Cannot tell (permissions, I/O error): fail closed.
+        Err(e) => Some(format!("kill switch file {} cannot be checked ({e}): input tools are disabled", f.display())),
     }
-    None
+}
+
+/// Make a value safe for one audit line: no control characters, quotes or spaces.
+pub fn audit_clean(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() || c == '"' || c == ' ' { '_' } else { c }).collect()
 }
 
 pub fn audit(dir: &Path, source: &str, a: &Action, tail: &str) {
-    let host = a.host().unwrap_or("-").replace(['"', '\n', ' '], "_");
+    let host = audit_clean(a.host().unwrap_or("-"));
     let line = format!(
-        "{} agent=\"{source}\" action={} host=\"{host}\" {} {tail}\n",
+        "{} agent=\"{source}\" action={} host=\"{host}\" {} {}\n",
         crate::host::unix_time(),
         a.name(),
-        a.audit_detail()
+        a.audit_detail(),
+        // control characters out; spaces and quotes are fine in the fixed tail
+        tail.chars().map(|c| if c.is_control() { '_' } else { c }).collect::<String>()
     );
     crate::host::write_audit(&dir.join("audit.log"), &line);
 }
@@ -653,6 +767,7 @@ impl Live {
         self.wait_frame(timeout)?;
         let g = self.shared.0.lock().map_err(|_| anyhow!("poisoned"))?;
         let f = g.frame.as_ref().ok_or_else(|| anyhow!("no frame"))?;
+        check_pixels(f.width, f.height)?;
         Ok((f.width, f.height, f.rgba.clone()))
     }
 
@@ -681,8 +796,19 @@ impl Drop for Live {
 
 // ------------------------------------------------------------------ PNG
 
+/// Largest picture we copy and encode (32 Mpixel covers 8K).
+pub const MAX_SCREENSHOT_PIXELS: u64 = 32 * 1024 * 1024;
+
+pub fn check_pixels(w: u32, h: u32) -> Result<()> {
+    if w as u64 * h as u64 > MAX_SCREENSHOT_PIXELS {
+        bail!("refusing picture of {w}x{h}: over the {} Mpixel screenshot limit", MAX_SCREENSHOT_PIXELS / (1024 * 1024));
+    }
+    Ok(())
+}
+
 /// Encode tightly packed RGBA8 as an RGB PNG (alpha dropped: screens are opaque).
 pub fn encode_png(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+    check_pixels(w, h)?;
     if w == 0 || h == 0 || rgba.len() != w as usize * h as usize * 4 {
         bail!("bad picture: {w}x{h} with {} bytes", rgba.len());
     }
@@ -890,12 +1016,70 @@ pub(crate) mod tests {
             allow,
             timeout: Duration::from_secs(1),
             source: "test",
+            recheck: None,
         };
         assert!(precheck(&t(None, None), "box").is_ok());
         assert!(precheck(&t(None, None), "other").unwrap_err().to_string().contains("not pinned"));
         assert!(precheck(&t(Some("AAAA-AAAA"), None), "box").is_err());
         assert!(precheck(&t(None, Some(vec![])), "box").unwrap_err().to_string().contains("allowlist"));
         assert!(precheck(&t(None, Some(vec![normalize_fingerprint(&fp)])), "box").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lone_printable_keys_are_never_audited() {
+        for combo in ["P", "shift+a", "Ж", "p", "shift+Ж", "7"] {
+            let d = Action::Key { host: "h".into(), combo: combo.into() }.audit_detail();
+            assert_eq!(d, "key=<printable>", "{combo}");
+        }
+        // with a real modifier or a named key the combo is useful and safe to log
+        assert_eq!(Action::Key { host: "h".into(), combo: "ctrl+c".into() }.audit_detail(), "combo=ctrl+c");
+        assert_eq!(Action::Key { host: "h".into(), combo: "Return".into() }.audit_detail(), "combo=Return");
+    }
+
+    #[test]
+    fn error_classes_do_not_echo_input() {
+        let e = parse_combo("ctrl+SecretKey").unwrap_err();
+        assert!(format!("{e:#}").contains("SecretKey"), "premise: the raw error echoes the combo");
+        assert_eq!(error_class(&e), "invalid_input");
+        assert_eq!(error_class(&anyhow!("host x is not pinned and no fingerprint")), "not_pinned");
+        assert_eq!(error_class(&anyhow!("something odd with hunter2")), "error");
+    }
+
+    #[test]
+    fn audit_values_have_no_control_characters() {
+        let dir = tempdir("auditclean");
+        let a = Action::Screenshot { host: "bo\nx\x1b[31m\"y z".into(), out: None, base64: false };
+        audit(&dir, "test", &a, "outcome=error\nINJECTED");
+        let log = std::fs::read_to_string(dir.join("audit.log")).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log:?}");
+        assert!(!log.contains('\x1b') && !log.contains("\"y"), "{log:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pixel_cap() {
+        assert!(check_pixels(7680, 4320).is_ok());
+        assert!(check_pixels(8192, 8192).is_err());
+        assert!(encode_png(8192, 8192, &[]).unwrap_err().to_string().contains("limit"));
+    }
+
+    #[test]
+    fn cli_rate_limit_file() {
+        let dir = tempdir("ratefile");
+        assert!(rate_check_file(&dir, 2) && rate_check_file(&dir, 2));
+        assert!(!rate_check_file(&dir, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kill_switch_fails_closed_when_unreadable() {
+        // A path component that is a file makes stat fail with NotADirectory, not NotFound.
+        let dir = tempdir("killclosed");
+        let file = dir.join("afile");
+        std::fs::write(&file, "").unwrap();
+        let why = kill_switch(&file).expect("must fail closed");
+        assert!(why.contains("cannot be checked"), "{why}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -27,6 +27,8 @@ struct FakeHost {
     addr: String,
     fp: String,
     seen: Seen,
+    /// Milliseconds the host waits before answering Hello (a slow consent prompt).
+    delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn spawn_host(clipboard: bool) -> FakeHost {
@@ -36,19 +38,22 @@ fn spawn_host(clipboard: bool) -> FakeHost {
     let addr = listener.local_addr().unwrap().to_string();
     let seen = Seen::default();
     let s = seen.clone();
+    let delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let d = delay_ms.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            let _ = serve(stream, &id, clipboard, &s); // aborted sessions (e.g. allowlist) are fine
+            let _ = serve(stream, &id, clipboard, &s, &d); // aborted sessions (e.g. allowlist) are fine
         }
     });
-    FakeHost { addr, fp, seen }
+    FakeHost { addr, fp, seen, delay_ms }
 }
 
-fn serve(stream: std::net::TcpStream, id: &Identity, clipboard: bool, seen: &Seen) -> anyhow::Result<()> {
+fn serve(stream: std::net::TcpStream, id: &Identity, clipboard: bool, seen: &Seen, delay_ms: &std::sync::atomic::AtomicU64) -> anyhow::Result<()> {
     let mut sess = fd_crypto::accept(stream, id)?;
     let ViewerMsg::Hello { viewer_name, caps: want, .. } = fd_proto::decode_viewer(&sess.reader.recv()?)? else { anyhow::bail!("no hello") };
     seen.hellos.lock().unwrap().push((viewer_name, want));
+    std::thread::sleep(Duration::from_millis(delay_ms.load(std::sync::atomic::Ordering::SeqCst)));
     let negotiated = caps::negotiate(want, if clipboard { caps::KNOWN } else { 0 });
     let send = |w: &mut fd_crypto::SecureWriter, m: &HostMsg| w.send(&fd_proto::encode(m).unwrap());
     send(&mut sess.writer, &HostMsg::Welcome { protocol: PROTOCOL_VERSION, host_name: "fakehost".into(), screen_width: W, screen_height: H, video_width: W, video_height: H, caps: negotiated })?;
@@ -83,7 +88,7 @@ fn serve(stream: std::net::TcpStream, id: &Identity, clipboard: bool, seen: &See
 }
 
 fn target<'a>(dir: &'a std::path::Path, fp: Option<&str>, allow: Option<Vec<String>>) -> Target<'a> {
-    Target { dir, expect_fp: fp.map(String::from), allow, timeout: Duration::from_secs(20), source: "test" }
+    Target { dir, expect_fp: fp.map(String::from), allow, timeout: Duration::from_secs(20), source: "test", recheck: None }
 }
 
 fn identity_of(dir: &std::path::Path) -> String {
@@ -206,5 +211,76 @@ fn clipboard_when_negotiated() {
     assert_eq!(*host.seen.clipboard.lock().unwrap(), vec!["to the host\n".to_string()]);
     let audit = std::fs::read_to_string(dir.join("audit.log")).unwrap();
     assert!(audit.contains("action=clipboard_set") && audit.contains("bytes=13") && !audit.contains("to the host"), "{audit}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pin a fresh loopback host in `dir` and return it.
+fn pinned_host(dir: &std::path::Path, clipboard: bool) -> FakeHost {
+    let host = spawn_host(clipboard);
+    agent::execute(&target(dir, Some(&host.fp), None), &Action::Status { host: host.addr.clone() }).unwrap();
+    host
+}
+
+fn input_actions(host: &str) -> Vec<Action> {
+    vec![
+        Action::Click { host: host.into(), x: 10, y: 10, button: MouseButton::Left, double: false },
+        Action::Key { host: host.into(), combo: "ctrl+c".into() },
+        Action::Type { host: host.into(), text: "abc".into() },
+        Action::ClipboardSet { host: host.into(), text: "x".into() },
+    ]
+}
+
+#[test]
+fn kill_switch_during_the_consent_wait_blocks_all_input() {
+    let dir = agent::tests::tempdir("loopback-killwait");
+    let host = pinned_host(&dir, true);
+    host.delay_ms.store(1200, std::sync::atomic::Ordering::SeqCst);
+    for a in input_actions(&host.addr) {
+        let kill = dir.join(agent::KILL_NAME);
+        let _ = std::fs::remove_file(&kill);
+        let k = kill.clone();
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            std::fs::write(k, "").unwrap();
+        });
+        // The kill file did not exist when the call began; it appears while connecting.
+        let e = agent::execute(&target(&dir, None, None), &a).unwrap_err();
+        flipper.join().unwrap();
+        assert!(e.to_string().contains("kill switch"), "{}: {e:#}", a.name());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(host.seen.inputs.lock().unwrap().is_empty() && host.seen.clipboard.lock().unwrap().is_empty(), "{} reached the host", a.name());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mcp_policy_revoked_during_the_consent_wait_blocks_input() {
+    let dir = agent::tests::tempdir("loopback-revoke");
+    let host = pinned_host(&dir, true);
+    let fp = fd_crypto::normalize_fingerprint(&host.fp);
+    host.delay_ms.store(1200, std::sync::atomic::Ordering::SeqCst);
+    let toml_on = format!("allow_hosts = [\"{fp}\"]\nallow_input = true\nallow_clipboard = \"write\"\n");
+    let toml_off = format!("allow_hosts = [\"{fp}\"]\n");
+    for (name, args) in [
+        ("freedomdesk_click", serde_json::json!({"host": host.addr, "x": 5, "y": 5})),
+        ("freedomdesk_key", serde_json::json!({"host": host.addr, "combo": "Return"})),
+        ("freedomdesk_type", serde_json::json!({"host": host.addr, "text": "z"})),
+        ("freedomdesk_clipboard_set", serde_json::json!({"host": host.addr, "text": "z"})),
+    ] {
+        std::fs::write(dir.join("agent.toml"), &toml_on).unwrap();
+        let (d2, off) = (dir.clone(), toml_off.clone());
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            std::fs::write(d2.join("agent.toml"), off).unwrap();
+        });
+        let mut server = crate::mcp::Server::live(&dir);
+        let line = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string();
+        let resp: serde_json::Value = serde_json::from_str(&server.handle_line(&line).unwrap()).unwrap();
+        flipper.join().unwrap();
+        assert_eq!(resp["result"]["isError"], true, "{name}: {resp}");
+        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("disabled"), "{name}: {resp}");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(host.seen.inputs.lock().unwrap().is_empty() && host.seen.clipboard.lock().unwrap().is_empty(), "{name} reached the host");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

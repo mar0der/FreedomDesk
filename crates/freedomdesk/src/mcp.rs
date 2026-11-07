@@ -37,11 +37,13 @@ pub struct AgentConfig {
     pub allow_input: bool,
     pub clipboard: ClipboardMode,
     pub rate_limit_per_minute: u32,
+    /// The CLI (`freedomdesk agent`) must obey this file too.
+    pub cli_requires_policy: bool,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { allow_hosts: Vec::new(), allow_input: false, clipboard: ClipboardMode::None, rate_limit_per_minute: 30 }
+        Self { allow_hosts: Vec::new(), allow_input: false, clipboard: ClipboardMode::None, rate_limit_per_minute: 30, cli_requires_policy: false }
     }
 }
 
@@ -91,6 +93,7 @@ impl AgentConfig {
                         })
                         .collect::<Result<_>>()?
                 }
+                "cli_requires_policy" => cfg.cli_requires_policy = parse_bool(&val).map_err(|e| at(e.to_string()))?,
                 "allow_input" => cfg.allow_input = parse_bool(&val).map_err(|e| at(e.to_string()))?,
                 "allow_clipboard" => {
                     cfg.clipboard = match val.trim_matches('"') {
@@ -160,6 +163,14 @@ pub fn authorize(cfg: &AgentConfig, kill: Option<&str>, a: &Action) -> Result<()
             Err(format!("clipboard writing is disabled: set `allow_clipboard = \"write\"` and `allow_input = true` in {CONFIG_FILE}"))
         }
         Action::ClipboardGet { .. } | Action::ClipboardSet { .. } => Ok(()),
+    }
+}
+
+/// Policy re-check for `Target::recheck`: reloads agent.toml and the kill switch every time.
+pub fn recheck_fn(dir: &Path) -> impl Fn(&Action) -> Result<(), String> + '_ {
+    move |a| {
+        let cfg = AgentConfig::load(dir).map_err(|e| format!("{e:#}"))?;
+        authorize(&cfg, agent::kill_switch(dir).as_deref(), a)
     }
 }
 
@@ -409,17 +420,21 @@ impl Server {
             agent::audit(dir, "mcp", &action, &format!("outcome={label} reason=\"{}\"", why.replace('"', "'")));
             tool_result(&json!({"ok": false, "error": why}), None, true)
         };
-        let cfg = match AgentConfig::load(&self.dir) {
+        let cfg = AgentConfig::load(&self.dir);
+        // Rate limit first, so a broken config cannot be used to hammer the server.
+        let limit = cfg.as_ref().map_or(AgentConfig::default().rate_limit_per_minute, |c| c.rate_limit_per_minute);
+        if !self.rate_ok(limit) {
+            return reply(deny(&self.dir, &format!("rate limit exceeded ({limit} calls per minute); wait and retry"), "rate_limited"));
+        }
+        let cfg = match cfg {
             Ok(c) => c,
             Err(e) => return reply(deny(&self.dir, &format!("{e:#}"), "denied")),
         };
-        if !self.rate_ok(cfg.rate_limit_per_minute) {
-            return reply(deny(&self.dir, &format!("rate limit exceeded ({} calls per minute); wait and retry", cfg.rate_limit_per_minute), "rate_limited"));
-        }
         if let Err(why) = authorize(&cfg, agent::kill_switch(&self.dir).as_deref(), &action) {
             return reply(deny(&self.dir, &why, "denied"));
         }
-        let target = Target { dir: &self.dir, expect_fp: None, allow: Some(cfg.allow_hosts.clone()), timeout: Duration::from_secs(30), source: "mcp" };
+        let rc = recheck_fn(&self.dir);
+        let target = Target { dir: &self.dir, expect_fp: None, allow: Some(cfg.allow_hosts.clone()), timeout: Duration::from_secs(30), source: "mcp", recheck: Some(&rc) };
         reply(match (self.exec)(&target, &action) {
             Ok(out) => {
                 let mut j = out.json;
@@ -443,19 +458,65 @@ fn tool_result(j: &Value, png: Option<Vec<u8>>, is_error: bool) -> Value {
 pub fn run(dir: &Path) -> Result<()> {
     let mut server = Server::live(dir);
     log::info!("freedomdesk MCP server (stdio) ready; config dir {}", dir.display());
-    let stdin = std::io::stdin();
+    let mut input = std::io::stdin().lock();
     let mut out = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(resp) = server.handle_line(&line) {
+    loop {
+        let resp = match read_capped_line(&mut input, MAX_LINE_BYTES)? {
+            Line::Eof => return Ok(()),
+            Line::TooLong => Some(err_resp(Value::Null, INVALID_REQUEST, &format!("message longer than {MAX_LINE_BYTES} bytes ignored"))),
+            Line::Text(l) if l.trim().is_empty() => None,
+            Line::Text(l) => server.handle_line(&l),
+        };
+        if let Some(resp) = resp {
             writeln!(out, "{resp}")?;
             out.flush()?;
         }
     }
-    Ok(())
+}
+
+/// Longest accepted JSON-RPC message (one line).
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Line {
+    Eof,
+    Text(String),
+    TooLong,
+}
+
+/// Read one `\n`-terminated line, never buffering more than `max` bytes: an over-long
+/// line is skipped to its end and reported as [`Line::TooLong`].
+pub fn read_capped_line<R: BufRead>(r: &mut R, max: usize) -> std::io::Result<Line> {
+    let mut buf = Vec::new();
+    let mut too_long = false;
+    loop {
+        let chunk = r.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(if too_long {
+                Line::TooLong
+            } else if buf.is_empty() {
+                Line::Eof
+            } else {
+                Line::Text(String::from_utf8_lossy(&buf).into_owned())
+            });
+        }
+        let (take, found) = match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        if !too_long {
+            if buf.len() + take > max {
+                too_long = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(&chunk[..take]);
+            }
+        }
+        r.consume(take);
+        if found {
+            return Ok(if too_long { Line::TooLong } else { Line::Text(String::from_utf8_lossy(&buf).into_owned()) });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -648,10 +709,35 @@ mod tests {
     }
 
     #[test]
+    fn long_lines_are_capped_and_skipped() {
+        let mut data = vec![b'x'; 50];
+        data.push(b'\n');
+        data.extend_from_slice(b"short\n");
+        data.extend_from_slice(b"last-no-newline");
+        let mut r = std::io::BufReader::with_capacity(8, std::io::Cursor::new(data));
+        assert_eq!(read_capped_line(&mut r, 20).unwrap(), Line::TooLong);
+        assert_eq!(read_capped_line(&mut r, 20).unwrap(), Line::Text("short\n".into()));
+        assert_eq!(read_capped_line(&mut r, 20).unwrap(), Line::Text("last-no-newline".into()));
+        assert_eq!(read_capped_line(&mut r, 20).unwrap(), Line::Eof);
+    }
+
+    #[test]
+    fn rate_limit_applies_even_with_a_broken_config() {
+        let (mut s, dir, _) = server("ratebad", Some("allow_input = maybe"));
+        let mut last = Value::Null;
+        for _ in 0..31 {
+            last = call(&mut s, "freedomdesk_machines", json!({}));
+        }
+        assert!(last["result"]["content"][0]["text"].as_str().unwrap().contains("rate limit"), "{last}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn config_parsing() {
         let c = AgentConfig::parse("# hi\nallow_hosts = [\n  \"abcd-efgh-ijkl-mnop-qrst-uvwx\", # laptop\n]\nrate_limit_per_minute = 5\nallow_clipboard = true\n").unwrap();
         assert_eq!(c.allow_hosts, vec![normalize_fingerprint(FP)]);
-        assert_eq!((c.rate_limit_per_minute, c.clipboard, c.allow_input), (5, ClipboardMode::Write, false));
+        assert_eq!((c.rate_limit_per_minute, c.clipboard, c.allow_input, c.cli_requires_policy), (5, ClipboardMode::Write, false, false));
+        assert!(AgentConfig::parse("cli_requires_policy = true").unwrap().cli_requires_policy);
         assert_eq!(AgentConfig::parse("").unwrap(), AgentConfig::default());
         for bad in ["allow_hosts = [\"short\"]", "allow_input = 1", "[section]", "bogus = 1", "rate_limit_per_minute = 0", "allow_clipboard = \"all\"", "allow_hosts = [\"a\""] {
             assert!(AgentConfig::parse(bad).is_err(), "{bad}");
