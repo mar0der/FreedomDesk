@@ -1,6 +1,6 @@
 # STATUS — FreedomDesk PO (the21th)
 
-_Last updated: 2026-11-07 ~10:10 Dubai (PO `freedomdesk-po`)_
+_Last updated: 2026-11-07 ~11:50 Dubai (PO `freedomdesk-po`)_
 
 ## Now
 - **GUI launcher shipped** (Petar 2026-11-07 "no terminal"): `freedomdesk` with no args / **FreedomDesk.app** (macOS aarch64, CI artifact, ad-hoc signed) opens a machine list (add/edit/remove, quick connect), first-connect fingerprint check, session in the same window, Disconnect → back. Reviewed by a sub-agent; 9 findings fixed.
@@ -8,6 +8,7 @@ _Last updated: 2026-11-07 ~10:10 Dubai (PO `freedomdesk-po`)_
   - Pending a **reboot of the21th** (Guardian to schedule — it kills tmux sessions): GDM Xorg greeter + NVIDIA EDID pin take effect then. Then verify greeter/lock after reboot, then the20th.
   - Backup + undo: `/var/backups/freedomdesk-h1/latest`, `sudo scripts/h1-undo.sh`.
 - **Petar's 09:44 GUI test: ~1 fps, clicks "dead"** → cause: the21th's TV went to standby ~08:30, no NVIDIA output lit → GNOME repaints ~1×/s (host sent every change). Not the GUI. Fix = H1 EDID pin (applied, needs GDM restart/reboot; blocked by FreedomOffice tests). Commit 73b525a: dark-display warning, per-session stats (fps/kbps/input), adaptive quality on slow links, SetView debounce.
+- **v0.1.0-alpha.2 published** (pre-release, Petar OK 11:36): tag → 6cdf075, .app zip + CLI tarballs + sha256. Notes via `.github/release-notes/<tag>.md` (workflow `release-notes.yml`).
 - Mac swap to the v2/GUI build: Guardian.
 
 ## Milestones
@@ -24,7 +25,7 @@ _Last updated: 2026-11-07 ~10:10 Dubai (PO `freedomdesk-po`)_
 ## Decisions (taken)
 - One binary; TCP + Noise_XX; postcard; protocol v2.
 - Root does no network parsing: service supervisor only; host runs as gdm / the user.
-- Keep auto-login; no TOTP for login/lock; Macs: one provisioning visit each; keep v0.1.0-alpha.1, no new tags without OK.
+- Keep auto-login; no TOTP for login/lock; Macs: one provisioning visit each; alpha.1 + alpha.2 pre-releases kept; no new tags without OK.
 - the20th: no EDID snippet while its TV is off (can't read the TV's own EDID; must not override the TV picture). Reboot/GDM restart only via Guardian.
 - OpenH264 from source. ⚠ patent cover only for Cisco's binary — decide before packaging.
 
