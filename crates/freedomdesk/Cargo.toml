@@ -13,6 +13,7 @@ clap.workspace = true
 directories.workspace = true
 ctrlc.workspace = true
 eframe.workspace = true
+arboard.workspace = true
 fd-proto.workspace = true
 fd-crypto.workspace = true
 fd-capture.workspace = true

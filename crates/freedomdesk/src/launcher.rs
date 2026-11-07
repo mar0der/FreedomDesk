@@ -204,6 +204,8 @@ pub struct FdApp {
     notice: Option<String>,
     /// The machines file exists but could not be read: never overwrite it.
     load_failed: bool,
+    /// Offer clipboard sync on the next connection (host must also allow it).
+    clipboard: bool,
 }
 
 const TITLE: &str = "FreedomDesk";
@@ -227,6 +229,7 @@ impl FdApp {
             error,
             notice: None,
             load_failed,
+            clipboard: false,
         };
         if let Some(c) = conn {
             app.enter_session(c, ctx);
@@ -264,7 +267,7 @@ impl FdApp {
         let (tx, rx) = mpsc::channel();
         let cancel: Cancel = Arc::default();
         let mut ui = GuiUi { tx: tx.clone(), ctx: ctx.clone(), cancel: cancel.clone() };
-        let opts = ConnectOpts { host: machine.address.clone(), expect_fingerprint: machine.fingerprint.clone(), name: None };
+        let opts = ConnectOpts { host: machine.address.clone(), expect_fingerprint: machine.fingerprint.clone(), name: None, clipboard: self.clipboard };
         let dir = self.dir.clone();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
@@ -400,6 +403,8 @@ impl FdApp {
 
             ui.add_space(12.0);
             ui.separator();
+            ui.checkbox(&mut self.clipboard, "Share clipboard (text) with the remote machine")
+                .on_hover_text("Only works if the host also enabled clipboard sync. Applies to the next connection.");
             ui.horizontal(|ui| {
                 ui.label("Quick connect:");
                 let r = ui.add(egui::TextEdit::singleline(&mut self.quick).hint_text("name or IP[:port]").desired_width(240.0));

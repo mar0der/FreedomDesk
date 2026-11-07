@@ -1,6 +1,7 @@
 //! FreedomDesk — one binary that is both host agent and viewer.
 
 mod authorized;
+mod clipboard;
 mod consent;
 mod host;
 mod keymap;

@@ -3,6 +3,7 @@
 use crate::{consent, load_identity, netpolicy};
 use anyhow::{anyhow, bail, Context, Result};
 use fd_crypto::{normalize_fingerprint, SecureWriter, Session};
+use crate::clipboard;
 use fd_proto::{HostMsg, Rect, ViewerMsg, DEFAULT_PORT, NORM_MAX, PROTOCOL_VERSION};
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -32,6 +33,10 @@ pub struct HostArgs {
     /// Stream the screen but ignore all remote input.
     #[arg(long)]
     view_only: bool,
+    /// Allow text clipboard sync with a viewer that also asks for it (off by
+    /// default). A view-only session never lets the viewer write this clipboard.
+    #[arg(long)]
+    clipboard: bool,
     #[arg(long, default_value_t = 30.0)]
     fps: f32,
     #[arg(long, default_value_t = 1920)]
@@ -194,9 +199,10 @@ fn handle(shared: &Shared, stream: TcpStream) -> Result<()> {
     let mut session = fd_crypto::accept(stream, &shared.identity).context("handshake")?;
     let fp = session.remote_fingerprint();
 
+    // `decode_viewer` also accepts an old viewer's Hello without capability bits.
     let hello: ViewerMsg =
-        fd_proto::decode(&session.reader.recv_limited(HELLO_MAX, Some(Instant::now() + HELLO_DEADLINE))?)?;
-    let ViewerMsg::Hello { protocol, viewer_name } = hello else {
+        fd_proto::decode_viewer(&session.reader.recv_limited(HELLO_MAX, Some(Instant::now() + HELLO_DEADLINE))?)?;
+    let ViewerMsg::Hello { protocol, viewer_name, caps: viewer_caps } = hello else {
         bail!("expected Hello");
     };
     let viewer_name = consent::sanitize(&viewer_name, 64);
@@ -246,7 +252,7 @@ fn handle(shared: &Shared, stream: TcpStream) -> Result<()> {
     }
     slot.release();
 
-    let outcome = stream_session(shared, session, &viewer_name);
+    let outcome = stream_session(shared, session, &viewer_name, viewer_caps);
     let how = match &outcome {
         Ok(()) => "ended".to_string(),
         Err(e) => format!("error: {e:#}"),
@@ -425,7 +431,7 @@ fn out_bounds(args: &HostArgs, r: ViewReq, scale_permille: u32) -> (u32, u32) {
     (w, h)
 }
 
-fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Result<()> {
+fn stream_session(shared: &Shared, session: Session, viewer_name: &str, viewer_caps: u32) -> Result<()> {
     let args = &shared.args;
     let mut capturer = fd_capture::open_default().context("opening screen capture")?;
     // The viewer draws the pointer itself (instant feedback); keep it out of the video.
@@ -450,6 +456,13 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         }
     };
 
+    // Clipboard: only with --clipboard AND a viewer that asked; view-only never lets it write here.
+    let negotiated = clipboard::host_negotiate(viewer_caps, args.clipboard, injector.is_some());
+    let (clip_send, clip_apply) = clipboard::host_perms(negotiated);
+    let clip_engine = if negotiated != 0 { clipboard::open_engine(clip_send, clip_apply) } else { None };
+    // Only advertise what is actually usable (e.g. the clipboard could not be opened).
+    let negotiated = if clip_engine.is_some() { negotiated } else { 0 };
+
     let Session { mut reader, writer, .. } = session;
     let shutdown = writer.shutdown_handle()?;
     if let Ok(mut g) = shared.active_socket.lock() {
@@ -467,6 +480,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         screen_height: sh,
         video_width: vw,
         video_height: vh,
+        caps: negotiated,
     })?;
     log::info!("session with {viewer_name} started: screen {sw}x{sh} → video ≤{vw}x{vh} @ {} fps", base_cfg.fps);
 
@@ -478,6 +492,23 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
     let counters = Arc::new(Counters::default());
     let quality_level = Arc::new(AtomicUsize::new(0));
     let started = Instant::now();
+    let audit_path = shared.audit_path.clone();
+
+    // Clipboard poller (host -> viewer).
+    let clip_thread = match clip_engine.clone().filter(|_| clip_send) {
+        Some(engine) => {
+            let (writer, audit_path, name) = (writer.clone(), audit_path.clone(), viewer_name.to_string());
+            Some(clipboard::spawn_poller(engine, stop.clone(), move |text| {
+                let n = text.len();
+                let ok = send_on(&writer, &HostMsg::Clipboard { text }).is_ok();
+                if ok {
+                    audit_clipboard(&audit_path, &name, "host_to_viewer", n);
+                }
+                ok
+            })?)
+        }
+        None => None,
+    };
 
     // Input / control thread.
     let input_thread = {
@@ -489,6 +520,7 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         let writer = writer.clone();
         let counters = counters.clone();
         let mut injector = injector;
+        let (clip_engine, audit_path, viewer_name) = (clip_engine.clone(), audit_path.clone(), viewer_name.to_string());
         std::thread::Builder::new().name("host-input".into()).spawn(move || {
             let mut size = pack(sw, sh);
             let result = (|| -> Result<()> {
@@ -537,6 +569,14 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
                             writer.lock().map_err(|_| anyhow!("writer poisoned"))?.send(&b)?;
                         }
                         ViewerMsg::Bye => return Ok(()),
+                        ViewerMsg::Clipboard { text } => {
+                            // Only reachable for a viewer that negotiated it; anything else is dropped.
+                            if let Some(n) = clip_engine.as_ref().and_then(|e| e.lock().ok()?.apply(&text)) {
+                                audit_clipboard(&audit_path, &viewer_name, "viewer_to_host", n);
+                            } else {
+                                log::debug!("dropped viewer clipboard ({} bytes)", text.len());
+                            }
+                        }
                         ViewerMsg::Hello { .. } => bail!("unexpected Hello"),
                     }
                 }
@@ -831,6 +871,9 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str) -> Resul
         *g = None;
     }
     let input_result = input_thread.join().map_err(|_| anyhow!("input thread panicked"))?;
+    if let Some(t) = clip_thread {
+        let _ = t.join();
+    }
     let secs = started.elapsed().as_secs_f64().max(0.001);
     log::info!(
         "session with {viewer_name} ended after {seq} frames in {secs:.0} s ({:.1} fps avg, {:.0} kbps avg); \
@@ -867,6 +910,16 @@ fn is_disconnect(e: &anyhow::Error) -> bool {
     })
 }
 
+/// One audit line per clipboard transfer: direction and size only, never the content.
+fn audit_clipboard(path: &Path, viewer: &str, direction: &str, bytes: usize) {
+    let line = format!(
+        "{} viewer=\"{}\" clipboard={direction} bytes={bytes}\n",
+        unix_time(),
+        viewer.replace('"', "'")
+    );
+    write_audit(path, &line);
+}
+
 fn audit(shared: &Shared, peer: &SocketAddr, name: &str, fp: &str, outcome: &str, dur: Duration) {
     let line = format!(
         "{} peer={peer} viewer=\"{}\" fingerprint={fp} outcome=\"{}\" duration_s={}\n",
@@ -875,7 +928,11 @@ fn audit(shared: &Shared, peer: &SocketAddr, name: &str, fp: &str, outcome: &str
         outcome.replace('"', "'"),
         dur.as_secs()
     );
-    if shared.audit_path.as_os_str() == "-" {
+    write_audit(&shared.audit_path, &line);
+}
+
+fn write_audit(path: &Path, line: &str) {
+    if path.as_os_str() == "-" {
         log::info!(target: "audit", "{}", line.trim_end());
         return;
     }
@@ -887,10 +944,10 @@ fn audit(shared: &Shared, peer: &SocketAddr, name: &str, fp: &str, outcome: &str
         opts.mode(0o600);
     }
     let r = opts
-        .open(&shared.audit_path)
+        .open(path)
         .and_then(|mut f| f.write_all(line.as_bytes()));
     if let Err(e) = r {
-        log::warn!("audit log {}: {e}", shared.audit_path.display());
+        log::warn!("audit log {}: {e}", path.display());
     }
 }
 

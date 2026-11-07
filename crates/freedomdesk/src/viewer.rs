@@ -1,6 +1,6 @@
 //! Viewer: connect, verify the host key, show the screen, forward input.
 
-use crate::{keymap, load_identity};
+use crate::{clipboard, keymap, load_identity};
 use anyhow::{anyhow, bail, Context, Result};
 use eframe::egui;
 use fd_crypto::{normalize_fingerprint, KnownHosts, PinCheck, SecureReader, SecureWriter};
@@ -8,6 +8,7 @@ use fd_proto::{HostMsg, InputEvent, MouseButton, Rect, ViewerMsg, DEFAULT_PORT, 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,9 @@ pub struct ViewArgs {
     /// input→pointer-echo and input→next-video-frame latency. Moves the real pointer!
     #[arg(long, default_value_t = 0)]
     probe_input: u32,
+    /// Offer text clipboard sync (the host must also run with --clipboard).
+    #[arg(long)]
+    clipboard: bool,
 }
 
 pub struct Connected {
@@ -47,6 +51,8 @@ pub struct Connected {
     pub host_fingerprint: String,
     video_size: (u32, u32),
     screen_size: (u32, u32),
+    /// Clipboard capability bits both sides agreed on (0 = no clipboard sync).
+    clipboard_caps: u32,
 }
 
 impl Connected {
@@ -60,6 +66,8 @@ pub struct ConnectOpts {
     pub host: String,
     pub expect_fingerprint: Option<String>,
     pub name: Option<String>,
+    /// Offer clipboard sync; it only happens if the host also enabled it.
+    pub clipboard: bool,
 }
 
 /// First connection to a host whose key we have never seen.
@@ -100,7 +108,12 @@ impl ConnectUi for TermUi {
 }
 
 pub fn run(dir: &Path, args: ViewArgs) -> Result<()> {
-    let opts = ConnectOpts { host: args.host.clone(), expect_fingerprint: args.expect_fingerprint.clone(), name: args.name.clone() };
+    let opts = ConnectOpts {
+        host: args.host.clone(),
+        expect_fingerprint: args.expect_fingerprint.clone(),
+        name: args.name.clone(),
+        clipboard: args.clipboard,
+    };
     let conn = connect(dir, &opts, &mut TermUi { trust_new: args.trust_new })?;
     if args.headless {
         headless(conn, args.frames, args.seconds, args.probe_input)
@@ -186,14 +199,19 @@ pub fn connect(dir: &Path, args: &ConnectOpts, ui: &mut dyn ConnectUi) -> Result
     if ui.cancelled() {
         bail!("cancelled");
     }
-    session.writer.send(&fd_proto::encode(&ViewerMsg::Hello { protocol: PROTOCOL_VERSION, viewer_name })?)?;
+    session.writer.send(&fd_proto::encode(&ViewerMsg::Hello {
+        protocol: PROTOCOL_VERSION,
+        viewer_name,
+        caps: clipboard::viewer_offer(args.clipboard),
+    })?)?;
     ui.status("Secure channel up. Waiting for the host to allow the session …");
 
     session.reader.set_timeout(Some(Duration::from_secs(330)))?;
-    let reply: HostMsg = fd_proto::decode(&session.reader.recv().context("waiting for host")?)?;
+    // `decode_host` also accepts an old host's Welcome without capability bits.
+    let reply: HostMsg = fd_proto::decode_host(&session.reader.recv().context("waiting for host")?)?;
     session.reader.set_timeout(None)?;
     match reply {
-        HostMsg::Welcome { protocol, host_name, screen_width, screen_height, video_width, video_height } => {
+        HostMsg::Welcome { protocol, host_name, screen_width, screen_height, video_width, video_height, caps } => {
             let host_name = clean(&host_name);
             if protocol != PROTOCOL_VERSION {
                 bail!("host speaks protocol {protocol}, we speak {PROTOCOL_VERSION}");
@@ -206,6 +224,8 @@ pub fn connect(dir: &Path, args: &ConnectOpts, ui: &mut dyn ConnectUi) -> Result
                 host_fingerprint: host_fp,
                 video_size: (video_width, video_height),
                 screen_size: (screen_width, screen_height),
+                // Never trust the host for more than we asked for.
+                clipboard_caps: fd_proto::caps::negotiate(clipboard::viewer_offer(args.clipboard), caps),
             })
         }
         HostMsg::Denied { reason } => bail!("host denied the session: {}", clean(&reason)),
@@ -232,6 +252,41 @@ fn clean(s: &str) -> String {
 
 fn now_us(t0: Instant) -> u64 {
     t0.elapsed().as_micros() as u64
+}
+
+/// Start clipboard sync if it was negotiated: opens the clipboard and polls it,
+/// queueing local changes for the host. The poller ends when the session's
+/// writer queue closes.
+fn start_clipboard(negotiated: u32, tx: &Sender<ViewerMsg>) -> Option<clipboard::SharedEngine> {
+    if negotiated == 0 {
+        return None;
+    }
+    let (may_send, may_apply) = clipboard::viewer_perms(negotiated);
+    let engine = clipboard::open_engine(may_send, may_apply)?;
+    if may_send {
+        let tx = tx.clone();
+        let started = clipboard::spawn_poller(engine.clone(), Arc::new(AtomicBool::new(false)), move |text| {
+            let n = text.len();
+            let ok = tx.send(ViewerMsg::Clipboard { text }).is_ok();
+            if ok {
+                log::info!(target: "audit", "clipboard viewer_to_host bytes={n}");
+            }
+            ok
+        });
+        if let Err(e) = started {
+            log::warn!("clipboard poller: {e}");
+        }
+    }
+    log::info!("clipboard sync on (send {may_send}, receive {may_apply})");
+    Some(engine)
+}
+
+/// Write host clipboard text locally (if negotiated). Logs the size only.
+fn apply_host_clipboard(clip: Option<&clipboard::SharedEngine>, text: &str) {
+    match clip.and_then(|e| e.lock().ok()?.apply(text)) {
+        Some(n) => log::info!(target: "audit", "clipboard host_to_viewer bytes={n}"),
+        None => log::debug!("dropped host clipboard ({} bytes)", text.len()),
+    }
 }
 
 /// Writer thread: drains the outgoing queue, pings once a second.
@@ -391,6 +446,7 @@ fn headless(conn: Connected, want: u64, seconds: f64, probe_moves: u32) -> Resul
     let wt = spawn_writer(conn.writer, rx, t0);
     let mut reader = conn.reader;
     reader.set_timeout(Some(Duration::from_secs(10)))?;
+    let clip = start_clipboard(conn.clipboard_caps, &tx);
     let mut dec = GatedDecoder::new()?;
     let mut st = Stats::default();
     let mut dims = (0, 0);
@@ -416,6 +472,7 @@ fn headless(conn: Connected, want: u64, seconds: f64, probe_moves: u32) -> Resul
         }
         let msg: HostMsg = fd_proto::decode(&reader.recv()?)?;
         match msg {
+            HostMsg::Clipboard { text } => apply_host_clipboard(clip.as_ref(), &text),
             HostMsg::Video { data, keyframe, .. } => {
                 st.bytes += data.len() as u64;
                 if let Some(f) = dec.decode(&data, keyframe, &tx) {
@@ -492,13 +549,21 @@ struct Latest {
     ended: Option<String>,
 }
 
-fn spawn_reader(mut reader: SecureReader, latest: Arc<Mutex<Latest>>, tx: Sender<ViewerMsg>, ctx: egui::Context, t0: Instant) {
+fn spawn_reader(
+    mut reader: SecureReader,
+    latest: Arc<Mutex<Latest>>,
+    tx: Sender<ViewerMsg>,
+    ctx: egui::Context,
+    t0: Instant,
+    clip: Option<clipboard::SharedEngine>,
+) {
     std::thread::spawn(move || {
         let result = (|| -> Result<String> {
             let mut dec = GatedDecoder::new()?;
             loop {
                 let msg: HostMsg = fd_proto::decode(&reader.recv()?)?;
                 match msg {
+                    HostMsg::Clipboard { text } => apply_host_clipboard(clip.as_ref(), &text),
                     HostMsg::Video { data, keyframe, region, screen_width, screen_height, .. } => {
                         let n = data.len() as u64;
                         let fits = |o: u32, l: u32, full: u32| o.checked_add(l).is_some_and(|e| e <= full) && l > 0;
@@ -1062,7 +1127,8 @@ impl ViewerApp {
         let (tx, rx) = mpsc::channel();
         let wt = spawn_writer(conn.writer, rx, t0);
         let latest = Arc::new(Mutex::new(Latest::default()));
-        spawn_reader(conn.reader, latest.clone(), tx.clone(), ctx.clone(), t0);
+        let clip = start_clipboard(conn.clipboard_caps, &tx);
+        spawn_reader(conn.reader, latest.clone(), tx.clone(), ctx.clone(), t0, clip);
         let (vw, vh) = conn.video_size;
         let screen = conn.screen_size;
         let full = Rect { x: 0, y: 0, w: screen.0, h: screen.1 };

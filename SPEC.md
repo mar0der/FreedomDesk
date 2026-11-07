@@ -64,7 +64,7 @@ Part of the FreedomOffice family (`mar0der/FreedomOffice`).
 |----|---------|-------|
 | P1-1 | Unattended access | Permanent password or key-based; service/daemon on host |
 | P1-2 | Quick-support / join code | One-time code, short TTL, attended (mum’s laptop scenario) |
-| P1-3 | Clipboard sync | Text first; files later |
+| P1-3 | Clipboard sync | Text first; files later. Text sync implemented opt-in, see docs/clipboard.md |
 | P1-4 | File transfer | Drag/drop or dual-pane; resume; integrity hash |
 | P1-5 | Multi-monitor | List displays; switch; optional span; encode active monitor preferentially (avoid NoMachine’s “all monitors → NVENC limit” pitfall) |
 | P1-6 | Audio (host → viewer) | PipeWire/WASAPI/CoreAudio capture |
