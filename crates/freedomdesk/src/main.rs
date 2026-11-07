@@ -4,6 +4,7 @@ mod authorized;
 mod consent;
 mod host;
 mod keymap;
+mod launcher;
 mod netpolicy;
 mod viewer;
 
@@ -19,8 +20,9 @@ struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
 
+    /// No command: open the GUI (saved machines + connect).
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -58,7 +60,10 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     let dir = config_dir(&cli.config_dir);
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        return launcher::run_gui(&dir, None);
+    };
+    match cmd {
         Cmd::Id => {
             let id = load_identity(&dir)?;
             println!("Device fingerprint: {}", id.fingerprint());

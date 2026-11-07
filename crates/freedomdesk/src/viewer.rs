@@ -40,21 +40,68 @@ pub struct ViewArgs {
     probe_input: u32,
 }
 
-struct Connected {
+pub struct Connected {
     reader: SecureReader,
     writer: SecureWriter,
-    host_name: String,
-    host_fingerprint: String,
+    pub host_name: String,
+    pub host_fingerprint: String,
     video_size: (u32, u32),
     screen_size: (u32, u32),
 }
 
+impl Connected {
+    pub fn video_size(&self) -> (u32, u32) {
+        self.video_size
+    }
+}
+
+/// What to connect to. Shared by the CLI and the GUI launcher.
+pub struct ConnectOpts {
+    pub host: String,
+    pub expect_fingerprint: Option<String>,
+    pub name: Option<String>,
+}
+
+/// First connection to a host whose key we have never seen.
+pub struct TrustPrompt {
+    pub label: String,
+    pub fingerprint: String,
+}
+
+/// How `connect` talks to the user: terminal or GUI.
+pub trait ConnectUi {
+    fn status(&mut self, msg: &str);
+    /// Unknown host key and no expected fingerprint: may we pin it?
+    fn trust(&mut self, prompt: &TrustPrompt) -> bool;
+    /// Called once the socket exists, so a GUI can abort a pending connect.
+    fn cancel_handle(&mut self, _h: fd_crypto::ShutdownHandle) {}
+}
+
+struct TermUi {
+    trust_new: bool,
+}
+
+impl ConnectUi for TermUi {
+    fn status(&mut self, msg: &str) {
+        eprintln!("{msg}");
+    }
+    fn trust(&mut self, p: &TrustPrompt) -> bool {
+        if self.trust_new {
+            return true;
+        }
+        eprintln!("First connection to {}. Host fingerprint:\n\n    {}\n", p.label, p.fingerprint);
+        eprintln!("Compare it with `freedomdesk id` on the host (read it out over the phone).");
+        confirm("Trust this host and remember its key? [y/N] ").unwrap_or(false)
+    }
+}
+
 pub fn run(dir: &Path, args: ViewArgs) -> Result<()> {
-    let conn = connect(dir, &args)?;
+    let opts = ConnectOpts { host: args.host.clone(), expect_fingerprint: args.expect_fingerprint.clone(), name: args.name.clone() };
+    let conn = connect(dir, &opts, &mut TermUi { trust_new: args.trust_new })?;
     if args.headless {
         headless(conn, args.frames, args.seconds, args.probe_input)
     } else {
-        gui(conn)
+        crate::launcher::run_gui(dir, Some(conn))
     }
 }
 
@@ -77,16 +124,19 @@ fn split_host(s: &str) -> (String, u16) {
     }
 }
 
-fn connect(dir: &Path, args: &ViewArgs) -> Result<Connected> {
+pub fn connect(dir: &Path, args: &ConnectOpts, ui: &mut dyn ConnectUi) -> Result<Connected> {
     let identity = load_identity(dir)?;
-    let (host, port) = split_host(&args.host);
+    let (host, port) = split_host(args.host.trim());
     let addr = (host.as_str(), port)
         .to_socket_addrs()
         .with_context(|| format!("resolving {host}"))?
         .next()
         .ok_or_else(|| anyhow!("{host} did not resolve"))?;
-    eprintln!("Connecting to {addr} …");
+    ui.status(&format!("Connecting to {addr} …"));
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).with_context(|| format!("connecting to {addr}"))?;
+    if let Ok(s) = stream.try_clone() {
+        ui.cancel_handle(fd_crypto::ShutdownHandle::from(s));
+    }
     let mut session = fd_crypto::connect(stream, &identity).context("secure handshake")?;
     let host_fp = session.remote_fingerprint();
 
@@ -104,17 +154,16 @@ fn connect(dir: &Path, args: &ViewArgs) -> Result<Connected> {
         PinCheck::Unknown => {
             let aliases = kh.labels_for(&session.remote_public);
             if !aliases.is_empty() {
-                eprintln!("Host key already pinned as: {} (same machine, new name).", aliases.join(", "));
+                ui.status(&format!("Host key already pinned as: {} (same machine, new name).", aliases.join(", ")));
             }
-            if args.expect_fingerprint.is_none() && aliases.is_empty() && !args.trust_new {
-                eprintln!("First connection to {label}. Host fingerprint:\n\n    {host_fp}\n");
-                eprintln!("Compare it with `freedomdesk id` on the host (read it out over the phone).");
-                if !confirm("Trust this host and remember its key? [y/N] ")? {
-                    bail!("not trusted; nothing was sent to the host (use --expect-fingerprint or --trust-new)");
-                }
+            if args.expect_fingerprint.is_none()
+                && aliases.is_empty()
+                && !ui.trust(&TrustPrompt { label: label.clone(), fingerprint: host_fp.clone() })
+            {
+                bail!("host not trusted; nothing was sent to it");
             }
             kh.pin(&label, &session.remote_public)?;
-            eprintln!("Pinned {label} = {host_fp}");
+            ui.status(&format!("Pinned {label} = {host_fp}"));
         }
         PinCheck::Mismatch { pinned_fingerprint } => bail!(
             "HOST KEY CHANGED for {label}!\n  pinned:    {pinned_fingerprint}\n  presented: {host_fp}\n\
@@ -128,7 +177,7 @@ fn connect(dir: &Path, args: &ViewArgs) -> Result<Connected> {
         format!("{user}@{}", crate::host::hostname())
     });
     session.writer.send(&fd_proto::encode(&ViewerMsg::Hello { protocol: PROTOCOL_VERSION, viewer_name })?)?;
-    eprintln!("Secure channel up (host {host_fp}). Waiting for the host to allow the session …");
+    ui.status("Secure channel up. Waiting for the host to allow the session …");
 
     session.reader.set_timeout(Some(Duration::from_secs(330)))?;
     let reply: HostMsg = fd_proto::decode(&session.reader.recv().context("waiting for host")?)?;
@@ -139,7 +188,7 @@ fn connect(dir: &Path, args: &ViewArgs) -> Result<Connected> {
             if protocol != PROTOCOL_VERSION {
                 bail!("host speaks protocol {protocol}, we speak {PROTOCOL_VERSION}");
             }
-            eprintln!("Allowed. {host_name}: screen {screen_width}x{screen_height}, video {video_width}x{video_height}");
+            ui.status(&format!("Allowed. {host_name}: screen {screen_width}x{screen_height}, video {video_width}x{video_height}"));
             Ok(Connected {
                 reader: session.reader,
                 writer: session.writer,
@@ -534,7 +583,7 @@ const EDGE_PAN_ZONE: f32 = 28.0;
 const EDGE_PAN_SPEED: f32 = 1200.0; // points per second at the very edge
 const VIEW_SEND_INTERVAL: Duration = Duration::from_millis(150);
 
-struct ViewerApp {
+pub struct ViewerApp {
     tx: Sender<ViewerMsg>,
     latest: Arc<Mutex<Latest>>,
     texture: Option<egui::TextureHandle>,
@@ -560,6 +609,21 @@ struct ViewerApp {
     fps_mark: (Instant, u64),
     fps: f64,
     ended: Option<String>,
+    /// Writer thread; handed to `CLOSERS` on drop so the Bye still goes out.
+    writer: Option<std::thread::JoinHandle<()>>,
+    /// User asked to leave the session (toolbar / "Back" button).
+    leave: bool,
+}
+
+/// Writer threads of closed sessions; joined before the process exits so the
+/// host gets a clean Bye.
+static CLOSERS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+pub fn join_closers() {
+    let hs: Vec<_> = std::mem::take(&mut *CLOSERS.lock().unwrap());
+    for h in hs {
+        let _ = h.join();
+    }
 }
 
 impl ViewerApp {
@@ -905,9 +969,8 @@ impl ViewerApp {
             }
         }
 
-        if let Some(msg) = &self.ended {
+        if self.ended.is_some() {
             painter.rect_filled(self.xf.rect, 0.0, egui::Color32::from_black_alpha(160));
-            painter.text(self.xf.rect.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(20.0), egui::Color32::WHITE);
         }
     }
 
@@ -945,6 +1008,9 @@ impl ViewerApp {
                             let c = self.xf.rect.center();
                             self.zoom_at(1.25, c);
                         }
+                        if clicked(ui.button("Disconnect")) {
+                            self.leave = true;
+                        }
                         let real = self.xf.scale * ppp * 100.0;
                         ui.label(format!("{real:.0}%"));
                         ui.weak("Ctrl+Alt+scroll / pinch · Ctrl+Alt+0 fit · Ctrl+Alt+1 1:1");
@@ -965,8 +1031,50 @@ fn map_button(b: egui::PointerButton) -> Option<MouseButton> {
     })
 }
 
-impl eframe::App for ViewerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl ViewerApp {
+    /// Start the session threads for an established connection.
+    pub fn start(conn: Connected, ctx: &egui::Context) -> Result<ViewerApp> {
+        let t0 = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        let wt = spawn_writer(conn.writer, rx, t0);
+        let latest = Arc::new(Mutex::new(Latest::default()));
+        spawn_reader(conn.reader, latest.clone(), tx.clone(), ctx.clone(), t0);
+        let (vw, vh) = conn.video_size;
+        let screen = conn.screen_size;
+        let full = Rect { x: 0, y: 0, w: screen.0, h: screen.1 };
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(vw as f32, vh as f32));
+        Ok(ViewerApp {
+            tx,
+            latest,
+            texture: None,
+            tex_region: full,
+            screen,
+            cursor_tex: None,
+            remote_cursor: None,
+            zoom: 1.0,
+            center: egui::pos2(screen.0 as f32 / 2.0, screen.1 as f32 / 2.0),
+            xf: ViewXf { rect, scale: 1.0, center: egui::Pos2::ZERO },
+            toolbar_rect: egui::Rect::NOTHING,
+            last_view_sent: None,
+            last_view_time: Instant::now() - VIEW_SEND_INTERVAL,
+            pending_move: None,
+            last_pos: None,
+            mods: Mods::default(),
+            buttons_down: Vec::new(),
+            scroll_acc: egui::Vec2::ZERO,
+            zoom_acc: 0.0,
+            title_base: format!("FreedomDesk — {} [{}]", conn.host_name, conn.host_fingerprint),
+            last_title: Instant::now() - Duration::from_secs(2),
+            fps_mark: (Instant::now(), 0),
+            fps: 0.0,
+            ended: None,
+            writer: Some(wt),
+            leave: false,
+        })
+    }
+
+    /// Draw one frame. Returns true when the user wants to leave the session.
+    pub fn show(&mut self, ctx: &egui::Context) -> bool {
         let ppp = ctx.pixels_per_point();
         let (total, rtt) = self.sync_textures(ctx);
         let rect = ctx.available_rect();
@@ -991,6 +1099,8 @@ impl eframe::App for ViewerApp {
         });
         if self.ended.is_none() {
             self.toolbar(ctx, ppp);
+        } else {
+            self.ended_panel(ctx);
         }
 
         // Title bar doubles as the status line.
@@ -1013,71 +1123,37 @@ impl eframe::App for ViewerApp {
         } else {
             ctx.request_repaint_after(if self.last_view_sent.is_some() { Duration::from_millis(200) } else { Duration::from_millis(50) });
         }
+        self.leave
+    }
+
+    /// After the session ended: explain why and offer a way back.
+    fn ended_panel(&mut self, ctx: &egui::Context) {
+        let msg = self.ended.clone().unwrap_or_default();
+        egui::Area::new(egui::Id::new("fd-ended"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).inner_margin(16.0).show(ui, |ui| {
+                    ui.set_max_width(480.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new(msg).size(16.0));
+                        ui.add_space(8.0);
+                        if ui.button("Back to machines").clicked() {
+                            self.leave = true;
+                        }
+                    });
+                });
+            });
     }
 }
 
 impl Drop for ViewerApp {
     fn drop(&mut self) {
         let _ = self.tx.send(ViewerMsg::Bye);
+        if let Some(h) = self.writer.take() {
+            CLOSERS.lock().unwrap().push(h);
+        }
     }
-}
-
-fn gui(conn: Connected) -> Result<()> {
-    let t0 = Instant::now();
-    let (tx, rx) = mpsc::channel();
-    let shutdown = conn.writer.shutdown_handle()?;
-    let wt = spawn_writer(conn.writer, rx, t0);
-    let latest = Arc::new(Mutex::new(Latest::default()));
-    let (vw, vh) = conn.video_size;
-    let screen = conn.screen_size;
-    let title_base = format!("FreedomDesk — {} [{}]", conn.host_name, conn.host_fingerprint);
-    let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(&title_base)
-            .with_inner_size([(vw as f32).min(1600.0), (vh as f32).min(900.0)]),
-        ..Default::default()
-    };
-    let reader = conn.reader;
-    let r = eframe::run_native(
-        "freedomdesk-viewer",
-        opts,
-        Box::new(move |cc| {
-            cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
-            spawn_reader(reader, latest.clone(), tx.clone(), cc.egui_ctx.clone(), t0);
-            let full = Rect { x: 0, y: 0, w: screen.0, h: screen.1 };
-            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(vw as f32, vh as f32));
-            Ok(Box::new(ViewerApp {
-                tx,
-                latest,
-                texture: None,
-                tex_region: full,
-                screen,
-                cursor_tex: None,
-                remote_cursor: None,
-                zoom: 1.0,
-                center: egui::pos2(screen.0 as f32 / 2.0, screen.1 as f32 / 2.0),
-                xf: ViewXf { rect, scale: 1.0, center: egui::Pos2::ZERO },
-                toolbar_rect: egui::Rect::NOTHING,
-                last_view_sent: None,
-                last_view_time: Instant::now() - VIEW_SEND_INTERVAL,
-                pending_move: None,
-                last_pos: None,
-                mods: Mods::default(),
-                buttons_down: Vec::new(),
-                scroll_acc: egui::Vec2::ZERO,
-                zoom_acc: 0.0,
-                title_base,
-                last_title: Instant::now(),
-                fps_mark: (Instant::now(), 0),
-                fps: 0.0,
-                ended: None,
-            }))
-        }),
-    );
-    // Window closed: ViewerApp dropped → Bye queued → writer exits.
-    let _ = wt.join();
-    shutdown.shutdown();
-    r.map_err(|e| anyhow!("viewer window: {e}"))
 }
 
 #[cfg(test)]

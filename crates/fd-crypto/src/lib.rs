@@ -292,6 +292,12 @@ impl SecureWriter {
 /// Closes a session's socket (both directions) from any thread.
 pub struct ShutdownHandle(TcpStream);
 
+impl From<TcpStream> for ShutdownHandle {
+    fn from(s: TcpStream) -> Self {
+        ShutdownHandle(s)
+    }
+}
+
 impl ShutdownHandle {
     pub fn shutdown(&self) {
         let _ = self.0.shutdown(std::net::Shutdown::Both);

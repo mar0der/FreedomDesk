@@ -59,7 +59,8 @@ jobs:
         run: |
           mkdir -p dist
           tar -C target/release -czf dist/freedomdesk-macos-aarch64.tar.gz freedomdesk
-          (cd dist && shasum -a 256 freedomdesk-macos-aarch64.tar.gz > freedomdesk-macos-aarch64.tar.gz.sha256)
+          scripts/macos-app.sh target/release/freedomdesk dist
+          (cd dist && shasum -a 256 freedomdesk-macos-aarch64.tar.gz FreedomDesk-macos-aarch64.app.zip > SHA256SUMS-macos)
       - uses: actions/upload-artifact@v4
         with:
           name: freedomdesk-macos-aarch64
