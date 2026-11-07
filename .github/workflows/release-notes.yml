@@ -1,0 +1,30 @@
+name: Release notes
+
+# Applies .github/release-notes/<tag>.md to the existing GitHub release <tag>
+# (notes only; the release stays a pre-release and is never marked latest).
+on:
+  push:
+    branches: [main]
+    paths: [".github/release-notes/**"]
+
+permissions:
+  contents: write
+
+jobs:
+  notes:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for f in .github/release-notes/*.md; do
+            tag=$(basename "$f" .md)
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$f" --prerelease --latest=false
+              echo "updated $tag"
+            else
+              echo "no release $tag yet; skipped"
+            fi
+          done
