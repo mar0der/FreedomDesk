@@ -22,12 +22,19 @@ Early planning / P0 MVP. See [SPEC.md](SPEC.md) for the full feature set, archit
 
 **First real use case:** remote support for family in Bulgaria over Tailscale.
 
+## AI agents (CLI + MCP)
+
+`freedomdesk agent <cmd>` (JSON CLI) and `freedomdesk mcp` (stdio MCP server) let an AI agent list machines, take screenshots, click, type, send keys and use the clipboard. Default is read-only; input and clipboard need an opt-in `agent.toml`, and a kill-switch file stops input at once.
+
+**Security note:** policy mode is **off by default**. The CLI is the human's own tool and does not read `agent.toml`, so an agent that has shell access (for example Claude Code with Bash) **can bypass the allow-list** by calling the CLI directly, or by editing `agent.toml`. The allow-list only protects against shell-less MCP clients. To close this, set `FREEDOMDESK_AGENT_MCP_ONLY=1` (or `cli_requires_policy = true` in `agent.toml`) and keep agents away from the config directory. See [docs/agent-interface.md](docs/agent-interface.md).
+
 ## Docs
 
 | File | What |
 |------|------|
 | [SPEC.md](SPEC.md) | Full product + architecture spec |
 | [STATUS.md](STATUS.md) | Living status for the PO agent |
+| [docs/agent-interface.md](docs/agent-interface.md) | `freedomdesk agent` CLI and `freedomdesk mcp` server for AI agents |
 | [CLAUDE.md](CLAUDE.md) | Standing rules for the Claude Code PO |
 | [LICENSE](LICENSE) | AGPL-3.0 |
 
