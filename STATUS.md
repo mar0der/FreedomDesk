@@ -1,41 +1,40 @@
 # STATUS — FreedomDesk PO (the21th)
 
-_Last updated: 2026-11-07 ~01:10 Dubai (PO `freedomdesk-po`)_
+_Last updated: 2026-11-07 ~08:00 Dubai (PO `freedomdesk-po`)_
 
 ## Now
-- **Protocol v2 shipped to main (149e296)** for Petar's Mac feedback:
-  - **Cursor lag fixed**: pointer drawn by the viewer at the local mouse position (instant); host pointer sent on its own channel. Loopback: old input→video-cursor median 56 ms vs host-pointer echo 17 ms.
-  - **Viewer zoom**: Fit / 1:1 (HiDPI-aware) / Ctrl+Alt+scroll, pinch, Ctrl+Alt + `= - 0 1` / arrows, edge-pan, hover toolbar. Host crops the 4K capture to the visible region → zoomed text is native resolution.
-- **Host on the21th runs v2** (`~/.local/bin/freedomdesk host --bind 100.116.143.66 --port 47801`, FP `L4O7-LFLS-PTVE-HW7U-RR6P-VZWO`). T2 re-passed with v2 (the20th `/tmp/freedomdesk-t2`). **Mac viewer must be swapped to the v2 CI artifact** (old v1 binary is refused: protocol mismatch).
-- Petar's Mac test of v1: works (T3 ✅ basic). Re-test v2 for lag + zoom.
-- Next: H1 (headless + greeter/lock) — **needs Petar's OK for system changes** (see Blocked).
+- **GUI launcher shipped** (Petar 2026-11-07 "no terminal"): `freedomdesk` with no args / **FreedomDesk.app** (macOS aarch64, CI artifact, ad-hoc signed) opens a machine list (add/edit/remove, quick connect), first-connect fingerprint check, session in the same window, Disconnect → back. Reviewed by a sub-agent; 9 findings fixed.
+- **H1 applied on the21th** (Petar approved 07:35): `freedomdesk.service` (root supervisor → host runs as the console session's uid; identity on a pipe; audit → journald) is **live** on 100.116.143.66:47801, same FP `L4O7-…-VZWO`. Verified now: T2 from the20th, lock screen wakes + is captured + takes input remotely.
+  - Pending a **reboot of the21th** (Guardian to schedule — it kills tmux sessions): GDM Xorg greeter + NVIDIA EDID pin take effect then. Then verify greeter/lock after reboot, then the20th.
+  - Backup + undo: `/var/backups/freedomdesk-h1/latest`, `sudo scripts/h1-undo.sh`.
+- Mac swap to the v2/GUI build waits for Petar (home 20 Nov).
 
 ## Milestones
 | M | Goal | State |
 |---|------|-------|
-| M0–M1 | Docs, capture→encode→decode | ✅ |
-| M2 | Networked P0 (the21th ↔ the20th/Mac) | ✅ T2 headless, T3 Mac GUI by Petar; v2 retest pending |
-| M3 | Crypto, consent, IDs, DoS limits | ✅ (glass-to-glass number still to measure on Tailscale) |
-| **H1–H6** | Headless, greeter/lock, root daemon, scoped perms, **agent access (MCP)**, Wayland, macOS headless — SPEC §16, `docs/design/headless-login-agents.md` | ⏳ next, in that order |
-| M4 | Join code + systemd autostart (folds into H2) | ⏳ |
-| M5–M10 | Clipboard/files/multi-monitor, relay, macOS/Win hosts, HW encode/audio, mobile/2FA, packaging/crash reporter | ⏳ |
+| M0–M3 | P0 capture→encode→viewer, crypto, consent, DoS limits | ✅ |
+| GUI | Launcher + saved machines + macOS .app | ✅ CI; Petar test 20 Nov |
+| **H1** | Xorg greeter, no-monitor EDID, root service | 🔶 the21th applied (reboot pending) → the20th |
+| H2–H6 | Session follow w/o reconnect, scoped perms, agent MCP, Wayland, macOS headless | ⏳ SPEC §16 |
+| M4 | Join code + autostart (service now covers autostart) | ⏳ |
+| I1 / A1–A2 | iPhone viewer, controlling agents (plan only) | 📝 SPEC §17 |
+| M5–M10 | Clipboard/files, relay, Mac/Win hosts, HW encode, packaging/crash reporter | ⏳ |
 
 ## Decisions (taken)
-- One binary; TCP + Noise_XX; postcard; protocol v2 (Video has region; cursor channel; SetView).
-- X11 first; Wayland via H5 spike before any box moves to 26.04.
-- Viewer holds only modifiers on host, taps other keys; macOS Cmd → Ctrl; Ctrl+Alt(+Option) = viewer hotkeys.
-- Host binds Tailscale IP only; unattended via `authorized_viewers` (re-read per connection).
+- One binary; TCP + Noise_XX; postcard; protocol v2.
+- Root does no network parsing: service supervisor only; host runs as gdm / the user.
+- Keep auto-login; no TOTP for login/lock; Macs: one provisioning visit each; keep v0.1.0-alpha.1, no new tags without OK.
+- the20th: no EDID snippet while its TV is off (can't read the TV's own EDID; must not override the TV picture). Reboot/GDM restart only via Guardian.
 - OpenH264 from source. ⚠ patent cover only for Cisco's binary — decide before packaging.
 
-## Blocked / needs Petar
-1. **H1 system changes on the21th + the20th** (all reversible, system-wide): GDM `WaylandEnable=false`, NVIDIA xorg.conf.d fixed-mode/EDID snippet, root systemd service. OK to proceed? Also: keep auto-login? Should `login` scope need a second factor?
-2. **Release `v0.1.0-alpha.1`** was published on 2026-11-06 (before the "no release without OK" note). Keep it or delete it? No new tags will be made without OK.
-3. Macs: one provisioning visit per Mac vs self-hosted MDM (TCC can't be granted remotely) — decide before H6.
+## Blocked / needs Petar or Guardian
+1. Guardian: schedule a the21th reboot (outbox note 20261107-0800).
+2. the20th H1 after the21th verifies; its GDM restart via Guardian.
 
 ## Known gaps
-- Windows AltGr / macOS Option characters not forwarded; Ctrl+Alt+F-key can VT-switch the host.
-- Consent dialog not killed if the viewer disconnects mid-prompt.
-- Full-4K→1600×900 convert 11 ms (powersave governor); fine at 30 fps.
+- Session change (greeter ↔ desktop) drops the viewer; reconnect by hand until H2 (auto-reconnect).
+- Windows AltGr / macOS Option characters not forwarded; consent dialog not killed if the viewer leaves.
+- .app is not notarised: first launch needs `xattr -dr com.apple.quarantine` or "Open Anyway".
 
 ## Notes
 - Do not disturb `freedomoffice-claude` or `the21th-claude`.

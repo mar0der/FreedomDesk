@@ -16,7 +16,16 @@ pub fn path(dir: &Path) -> PathBuf {
 
 /// (normalised fingerprint, label) pairs. Missing file = empty list.
 pub fn load(dir: &Path) -> Vec<(String, String)> {
-    let Ok(text) = std::fs::read_to_string(path(dir)) else { return Vec::new() };
+    let text = match std::fs::read_to_string(path(dir)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            // Under `freedomdesk service` the host runs as the session user:
+            // the file must be world-readable (it holds public fingerprints only).
+            log::warn!("cannot read {}: {e} — nobody is authorised for unattended access", path(dir).display());
+            return Vec::new();
+        }
+    };
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))

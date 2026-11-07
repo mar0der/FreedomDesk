@@ -43,7 +43,21 @@ Unattended (skip the dialog for a known viewer): on the viewer run `freedomdesk 
 The Mac build is **viewer-only** (`host` says "Linux-only for now"). The viewer needs no
 macOS permissions (it doesn't capture or inject anything locally).
 
-**Get the binary** — either:
+**The app (recommended, no terminal):** `FreedomDesk-macos-aarch64.app.zip` from the CI
+artifact `freedomdesk-macos-aarch64` (or a release, once Petar OKs one). Unzip, move
+`FreedomDesk.app` to `~/Applications` (or /Applications). It is ad-hoc signed, not notarised, so
+macOS blocks the first launch of a downloaded copy. Either run
+`xattr -dr com.apple.quarantine ~/Applications/FreedomDesk.app` once, or try to open it and then
+use System Settings → Privacy & Security → "Open Anyway". Then double-click it:
+- the window lists saved machines; **Add machine** → name, address (`100.116.143.66`), and
+  optionally the fingerprint (`L4O7-LFLS-PTVE-HW7U-RR6P-VZWO`), → **Connect**;
+- without a saved fingerprint, the first connect shows the host's fingerprint to compare; after
+  "They match" it is pinned and saved with the machine;
+- **Disconnect** is in the top-edge toolbar; when a session ends, "Back to machines" returns to the list;
+- the app shares the CLI's identity and pins (`~/Library/Application Support/org.FreedomDesk.freedomdesk`),
+  so a Mac already authorised on the host stays authorised.
+
+**Or the command-line binary** — either:
 - **Build on the Mac** (Rust ≥ 1.89; nasm not needed):
   ```
   git clone https://github.com/mar0der/FreedomDesk && cd FreedomDesk
@@ -61,7 +75,8 @@ macOS permissions (it doesn't capture or inject anything locally).
 **Authorise the Mac on the host** (once — so nobody has to click Allow on the21th):
 ```
 ./freedomdesk id                                   # on the Mac: note "Device fingerprint"
-ssh the21th ~/.local/bin/freedomdesk authorize <MAC-FP> --label petar-macbook
+ssh the21th sudo /usr/local/bin/freedomdesk --config-dir /etc/freedomdesk authorize <MAC-FP> --label petar-macbook
+#  (the21th runs the system service since H1; the file must stay world-readable: 0644)
 ```
 (Without this, the21th shows an Allow/Deny dialog and auto-denies after 30 s.)
 
@@ -78,3 +93,5 @@ Checklist: same as T2, plus Mac specifics —
 - [ ] zoom: pinch, Ctrl+Option+scroll, Ctrl+Option+1 (1:1), Ctrl+Option+0 (fit), toolbar at the top edge
 - [ ] zoomed in, 4K text is sharp (host crops natively); edge-pan by moving to the window edge
 - [ ] clicks land exactly under the cursor at fit, 1:1 and 400%
+- [ ] app: double-click launches; add / edit / remove a machine; quick connect; Disconnect → list
+- [ ] app: lock the21th (Super+L) from the viewer, unlock by typing the password

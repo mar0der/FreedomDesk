@@ -361,6 +361,28 @@ Full research and design: [`docs/design/headless-login-agents.md`](docs/design/h
 | H5 | Wayland decision + implementation | spike report, then chosen backend before any box moves to 26.04 |
 | H6 | macOS headless host (with M7) | Mac mini on a dummy plug: login window, lock screen, admin prompt usable remotely; provisioning checklist |
 
+Decisions from Petar (2026-11-07): H1 approved on the21th then the20th (reversible, backups + undo script). Keep auto-login. No second factor for login/lock access. Macs: one provisioning visit each (no MDM).
+
+## 17. Later phases: iPhone viewer, controlling agents (added 2026-11-07, plan only)
+
+Petar wants to connect from an iPhone, and to use FreedomDesk to supervise AI agents running on remote machines. Nothing here is built yet. It sits after H1–H4 and M5.
+
+### 17.1 iPhone / iPad viewer (I1)
+- **Shape:** a native SwiftUI shell around the shared Rust core (`fd-proto`, `fd-crypto`, `fd-codec` decode path) built as a static library via `cargo` + `swift-bridge`/UniFFI. Video decode uses VideoToolbox (hardware H.264), not OpenH264. One code path for Noise, pinning and the protocol.
+- **UX:** saved machines (same model as the desktop launcher), TOFU fingerprint screen, Face ID to unlock the device key (Keychain, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, Secure Enclave-wrapped). Touch model: one finger = pointer (trackpad mode by default, direct-touch toggle), two-finger scroll, pinch = viewer zoom (host-side crop, same `SetView`), long-press = right click, on-screen keyboard plus a modifier bar (Ctrl/Alt/Super/Esc/Tab/arrows).
+- **Network:** over the Tailscale iOS app (works today, no new infrastructure). Later the M6 relay for non-Tailscale users.
+- **Distribution:** TestFlight for the family; App Store only after Petar decides (needs a developer account, privacy review, export-compliance answer for encryption).
+- **Exit criteria:** from an iPhone on cellular + Tailscale, log in to the21th's greeter, unlock, open a terminal; latency and battery measured.
+
+### 17.2 Controlling agents on remote machines (A1–A2)
+Builds on H3 (scoped keys) and H4 (`freedomdesk mcp` / `act`).
+- **A1 — agent sessions are visible and steerable:** a host can run several agent sessions (H4). The viewer gets an "Agents" panel per machine: who is connected (agent key label), what it is doing (last N actions from the audit stream, live), a thumbnail of what it sees, and buttons: pause (input from that agent is held), take over (human input wins, agent gets read-only), resume, kill (revokes the session at once; same path as `freedomdesk kill`).
+- **A2 — dispatch work to an agent from the viewer/iPhone:** start or message a Claude Code session on the remote machine (e.g. a named tmux session) through a narrow, audited "agent control" channel. Not a general remote shell: an allow-listed set of operations (list sessions, send a prompt, read the transcript tail, stop). It needs its own permission scope (`agents`) and is off by default.
+- **Safety:** every agent action is audited with the agent key and session; an on-screen indicator shows when an agent is driving; humans can always pre-empt; agent keys never get `login` scope unless granted explicitly and time-limited (`until=`).
+- **Exit criteria:** from the Mac viewer (and later the iPhone), see an agent working on the21th, pause it, take over, resume, and kill it; every step appears in the audit log.
+
+Order: H1 → H2 → H3 → H4 → A1 → I1 → A2 (I1 can move earlier if Petar wants the phone sooner; it only needs the existing protocol).
+
 ---
 
 _End of SPEC v0.1 — PO should treat this as living; update STATUS.md when milestones move._
