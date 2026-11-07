@@ -199,6 +199,16 @@ pub fn open_engine(may_send: bool, may_apply: bool) -> Option<SharedEngine> {
     }
 }
 
+/// Sets the flag when dropped: ties a poller's lifetime to a session scope, so
+/// it also stops on early returns and when the session object is dropped.
+pub struct StopOnDrop(pub Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Poll in a background thread until `stop` is set; `send` gets each new local
 /// text and returns false when the session is gone.
 pub fn spawn_poller(
@@ -222,6 +232,18 @@ pub fn spawn_poller(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poller_stops_when_scope_drops() {
+        let fake = Fake::default();
+        let engine: SharedEngine = Arc::new(Mutex::new(Engine::new(Box::new(fake) as Box<dyn ClipboardBackend>, true, true)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let guard = StopOnDrop(stop.clone());
+        let h = spawn_poller(engine, stop.clone(), |_| true).unwrap();
+        drop(guard);
+        assert!(stop.load(Ordering::SeqCst));
+        h.join().unwrap(); // returns within one poll period
+    }
 
     /// In-memory clipboard; the `Arc` lets tests play the role of "another app".
     #[derive(Clone, Default)]

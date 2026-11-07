@@ -255,9 +255,9 @@ fn now_us(t0: Instant) -> u64 {
 }
 
 /// Start clipboard sync if it was negotiated: opens the clipboard and polls it,
-/// queueing local changes for the host. The poller ends when the session's
-/// writer queue closes.
-fn start_clipboard(negotiated: u32, tx: &Sender<ViewerMsg>) -> Option<clipboard::SharedEngine> {
+/// queueing local changes for the host. The poller ends when `stop` is set
+/// (the session scope drops) or the session's writer queue closes.
+fn start_clipboard(negotiated: u32, tx: &Sender<ViewerMsg>, stop: &Arc<AtomicBool>) -> Option<clipboard::SharedEngine> {
     if negotiated == 0 {
         return None;
     }
@@ -265,7 +265,7 @@ fn start_clipboard(negotiated: u32, tx: &Sender<ViewerMsg>) -> Option<clipboard:
     let engine = clipboard::open_engine(may_send, may_apply)?;
     if may_send {
         let tx = tx.clone();
-        let started = clipboard::spawn_poller(engine.clone(), Arc::new(AtomicBool::new(false)), move |text| {
+        let started = clipboard::spawn_poller(engine.clone(), stop.clone(), move |text| {
             let n = text.len();
             let ok = tx.send(ViewerMsg::Clipboard { text }).is_ok();
             if ok {
@@ -446,7 +446,8 @@ fn headless(conn: Connected, want: u64, seconds: f64, probe_moves: u32) -> Resul
     let wt = spawn_writer(conn.writer, rx, t0);
     let mut reader = conn.reader;
     reader.set_timeout(Some(Duration::from_secs(10)))?;
-    let clip = start_clipboard(conn.clipboard_caps, &tx);
+    let clip_stop = clipboard::StopOnDrop(Arc::new(AtomicBool::new(false)));
+    let clip = start_clipboard(conn.clipboard_caps, &tx, &clip_stop.0);
     let mut dec = GatedDecoder::new()?;
     let mut st = Stats::default();
     let mut dims = (0, 0);
@@ -694,6 +695,8 @@ pub struct ViewerApp {
     writer: Option<std::thread::JoinHandle<()>>,
     /// User asked to leave the session (toolbar / "Back" button).
     leave: bool,
+    /// Stops the clipboard poller when the session ends.
+    _clip_stop: clipboard::StopOnDrop,
 }
 
 /// Writer threads of closed sessions; joined before the process exits so the
@@ -1127,7 +1130,8 @@ impl ViewerApp {
         let (tx, rx) = mpsc::channel();
         let wt = spawn_writer(conn.writer, rx, t0);
         let latest = Arc::new(Mutex::new(Latest::default()));
-        let clip = start_clipboard(conn.clipboard_caps, &tx);
+        let clip_stop = clipboard::StopOnDrop(Arc::new(AtomicBool::new(false)));
+        let clip = start_clipboard(conn.clipboard_caps, &tx, &clip_stop.0);
         spawn_reader(conn.reader, latest.clone(), tx.clone(), ctx.clone(), t0, clip);
         let (vw, vh) = conn.video_size;
         let screen = conn.screen_size;
@@ -1161,6 +1165,7 @@ impl ViewerApp {
             ended: None,
             writer: Some(wt),
             leave: false,
+            _clip_stop: clip_stop,
         })
     }
 
@@ -1241,6 +1246,7 @@ impl ViewerApp {
 
 impl Drop for ViewerApp {
     fn drop(&mut self) {
+        // `_clip_stop` (a field) stops the clipboard poller as the struct drops.
         let _ = self.tx.send(ViewerMsg::Bye);
         if let Some(h) = self.writer.take() {
             CLOSERS.lock().unwrap().push(h);

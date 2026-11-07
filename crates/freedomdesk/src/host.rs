@@ -495,6 +495,8 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str, viewer_c
     let audit_path = shared.audit_path.clone();
 
     // Clipboard poller (host -> viewer).
+    // Stops the poller on every exit path, including early `?` returns below.
+    let _clip_guard = clipboard::StopOnDrop(stop.clone());
     let clip_thread = match clip_engine.clone().filter(|_| clip_send) {
         Some(engine) => {
             let (writer, audit_path, name) = (writer.clone(), audit_path.clone(), viewer_name.to_string());
@@ -525,7 +527,9 @@ fn stream_session(shared: &Shared, session: Session, viewer_name: &str, viewer_c
             let mut size = pack(sw, sh);
             let result = (|| -> Result<()> {
                 loop {
-                    let bytes = reader.recv()?;
+                    // Viewer messages are small; the largest legitimate one is a clipboard
+                    // (capped at CLIPBOARD_MAX_BYTES). Refuse bigger ones before allocating.
+                    let bytes = reader.recv_limited(fd_proto::CLIPBOARD_MAX_BYTES + 64 * 1024, None)?;
                     match fd_proto::decode::<ViewerMsg>(&bytes)? {
                         ViewerMsg::Input(ev) => {
                             counters.inputs.fetch_add(1, Ordering::Relaxed);
